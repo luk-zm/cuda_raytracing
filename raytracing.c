@@ -2,32 +2,33 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
-typedef int8_t s8;
-typedef int16_t s16;
-typedef int32_t s32;
-typedef int64_t s64;
+typedef int8_t i8;
+typedef int16_t i16;
+typedef int32_t i32;
+typedef int64_t i64;
 typedef int32_t b32; // boolean
 typedef float f32;
 typedef double f64;
 
-s32 char_buf_to_uint32(char *buf, s32 buf_length, u32 num) {
+i32 char_buf_to_uint32(char *buf, i32 buf_length, u32 num) {
   if (buf_length <= 0)
     return 0;
 
   buf[0] = '0' + num % 10;
   num /= 10;
-  s32 i;
+  i32 i;
   for (i = 1; i < buf_length && num != 0; ++i) {
     buf[i] = '0' + num % 10;
     num /= 10;
   }
 
-  s32 number_of_digits = i;
+  i32 number_of_digits = i;
   for (i = 0; i < number_of_digits / 2; ++i) {
     char temp = buf[i];
     buf[i] = buf[number_of_digits - i - 1];
@@ -49,28 +50,33 @@ vec3 Vec3(f32 x, f32 y, f32 z) {
 }
 
 // TODO: handle fwrite return values, consider s_fopen
-void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_height, u32 pixels_width) {
+void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
   FILE *img_file = fopen("image.ppm", "wb");
-  fwrite("P6\n", sizeof(char), strlen("P6\n"), img_file);
+  if (img_file == NULL) {
+    fprintf(stderr, "Couldn't open the file for writing\n");
+    return;
+  }
+
+  u64 written = fwrite("P6\n", sizeof(char), strlen("P6\n"), img_file);
   
   char pixels_width_buf[10];
-  s32 pixels_width_digits = char_buf_to_uint32(pixels_width_buf, 10, pixels_width);
-  fwrite(pixels_width_buf, sizeof(char), pixels_width_digits, img_file);
+  i32 pixels_width_digits = char_buf_to_uint32(pixels_width_buf, 10, pixels_width);
+  written = fwrite(pixels_width_buf, sizeof(char), pixels_width_digits, img_file);
 
-  fwrite(" ", sizeof(char), 1, img_file);
+  written = fwrite(" ", sizeof(char), 1, img_file);
 
   char pixels_height_buf[10];
-  s32 pixels_height_digits = char_buf_to_uint32(pixels_height_buf, 10, pixels_height);
-  fwrite(pixels_height_buf, sizeof(char), pixels_height_digits, img_file);
+  i32 pixels_height_digits = char_buf_to_uint32(pixels_height_buf, 10, pixels_height);
+  written = fwrite(pixels_height_buf, sizeof(char), pixels_height_digits, img_file);
 
-  fwrite("\n255\n", sizeof(char), strlen("\n255\n"), img_file);
+  written = fwrite("\n255\n", sizeof(char), strlen("\n255\n"), img_file);
 
-  for (s32 i = 0; i < pixels_height; ++i) {
-    for (s32 j = 0; j < pixels_width; ++j) {
+  for (i32 i = 0; i < pixels_height; ++i) {
+    for (i32 j = 0; j < pixels_width; ++j) {
       u8 r = (u8)(pixels_colors[i * pixels_width + j].x * 255);
       u8 g = (u8)(pixels_colors[i * pixels_width + j].y * 255);
       u8 b = (u8)(pixels_colors[i * pixels_width + j].z * 255);
-      // s32 bgr = (b << 16) | (g << 8) | r;
+      // i32 bgr = (b << 16) | (g << 8) | r;
       fwrite(&r, sizeof(r), 1, img_file);
       fwrite(&g, sizeof(g), 1, img_file);
       fwrite(&b, sizeof(b), 1, img_file);
@@ -163,8 +169,10 @@ vec3 vec3_to_unit_vec(vec3 v) {
 	return result;
 }
 
-b32 vec3_is_same(vec3 v1, vec3 v2) {
-  return v1.x == v2.x && v1.y == v2.y && v1.z == v2.z;
+b32 vec3_is_same_approx(vec3 v1, vec3 v2) {
+  return (v1.x - v2.x < 0.000001f) 
+    && (v1.y - v2.y < 0.000001f)  
+    && (v1.z - v2.z < 0.000001f);
 }
 
 vec3 Color(f32 x, f32 y, f32 z) {
@@ -186,63 +194,68 @@ vec3 zero_vec() {
 }
 
 b32 vec3_to_unit_vec_test() {
-  vec3 input_vectors[] = { Vec3(1.0f, 1.0f, 1.0f), Vec3(0.5f, 0.5f, 0.5f),
+  fprintf(stderr, "vec3_to_unit test start\n");
+  vec3 inputs[] = { Vec3(1.0f, 1.0f, 1.0f), Vec3(0.5f, 0.5f, 0.5f),
     Vec3(10.0f, 0.5f, 12.7f) };
-  vec3 output_vectors[] = { Vec3(0.57735f, 0.57735f, 0.57735f),
+  vec3 expected[] = { Vec3(0.57735f, 0.57735f, 0.57735f),
     Vec3(0.57735f, 0.57735f, 0.57735f), Vec3(0.61835f, 0.030917f, 0.7853f) };
-  s32 vec_count = sizeof(input_vectors) / sizeof(input_vectors[0]);
-  for (s32 i = 0; i < vec_count; ++i) {
-    if (vec3_is_same(input_vectors[i], output_vectors[i])) {
+  i32 vec_count = sizeof(inputs) / sizeof(inputs[0]);
+  for (i32 i = 0; i < vec_count; ++i) {
+    inputs[i] = vec3_to_unit_vec(inputs[i]);
+    if (!vec3_is_same_approx(inputs[i], expected[i])) {
+      fprintf(stderr, "vec3_to_unit test failure\n");
       fprintf(stderr, "Failed at input vector #%d\n", i);
+      fprintf(stderr, "Expected (%f, %f, %f), got (%f, %f, %f)", 
+          expected[i].x, expected[i].y, expected[i].z,
+          inputs[i].x, inputs[i].y, inputs[i].z);
       return 0;
     }
   }
+  fprintf(stderr, "vec3_to_unit test success\n");
   return 1;
 }
 
-void ray_color_test() {
-  vec3 directions[] = { Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f),
-    Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f)};
-}
-
-s32 main() {
+i32 main() {
   vec3_to_unit_vec_test();
 
-	s32 img_height = 400;
-	f32 img_ratio = 16.0/9.0;
-	s32 img_width = (int)(img_height * img_ratio);
+	i32 img_width = 400;
+	f32 img_ratio = 16.0f/9.0f;
+	i32 img_height = (int)(img_width / img_ratio);
 	
 	f32 camera_viewport_dist = 1.0f;
 	f32 viewport_height = 2.0f;
-	f32 viewport_ratio = (f32)img_height /  (f32)img_width;
+	f32 viewport_ratio = (f32)img_width /  (f32)img_height;
 	f32 viewport_width = viewport_height * viewport_ratio;
 	vec3 camera_pos = { 0.0f, 0.0f, 0.0f };
 	
-	vec3 viewport_q = camera_pos;
-	viewport_q.x -= viewport_width / 2;
-	viewport_q.y += viewport_height / 2;
-	viewport_q.z -= camera_viewport_dist;
+	vec3 viewport_left_upper_corner = camera_pos;
+	viewport_left_upper_corner.x -= viewport_width / 2;
+	viewport_left_upper_corner.y += viewport_height / 2;
+	viewport_left_upper_corner.z += camera_viewport_dist;
 
-	f32 pixel_dist = viewport_height / img_height;
+	f32 pixel_dist_y = viewport_height / img_height;
+	f32 pixel_dist_x = viewport_width / img_width;
 	
-	vec3 p00 = viewport_q;
-	p00.x += pixel_dist;
-	p00.y -= pixel_dist;
+	vec3 current_pixel_center = viewport_left_upper_corner;
+	current_pixel_center.x += 0.5 * pixel_dist_x;
+	current_pixel_center.y -= 0.5 * pixel_dist_y;
 	
-  // todo: get rid of VLAs
-	vec3 rays_directions[img_height][img_width];
-	vec3 pixels_colors[img_height][img_width];
-	
-	for (s32 i = 0; i < img_height; ++i) {
-		for (s32 j = 0; j < img_width; ++j) {
-			rays_directions[i][j].x = p00.x + i * pixel_dist;
-			rays_directions[i][j].y = p00.y + j * pixel_dist;
-      rays_directions[i][j].z = p00.z;
-      vec3_inplace_sub(&rays_directions[i][j], camera_pos);
+  vec3 *rays_directions = calloc(img_height * img_width, sizeof(vec3));
+  vec3 *pixels_colors = calloc(img_height * img_width, sizeof(vec3));
 
-      pixels_colors[i][j] = ray_color(camera_pos, rays_directions[i][j]);
+  f32 p00x = current_pixel_center.x;
+	
+	for (i32 i = 0; i < img_height; ++i) {
+		for (i32 j = 0; j < img_width; ++j) {
+			rays_directions[i * img_width + j] = current_pixel_center;
+      vec3_inplace_sub(&rays_directions[i * img_width + j], camera_pos);
+
+      pixels_colors[i * img_width + j] = ray_color(camera_pos, rays_directions[i * img_width + j]);
+      current_pixel_center.x += pixel_dist_x;
 		}
+    current_pixel_center.y -= pixel_dist_y;
+    current_pixel_center.x = p00x;
 	}
 
-  pixels_to_ppm((vec3 *)pixels_colors, img_height, img_width);
+  pixels_to_ppm(pixels_colors, img_width, img_height);
 }
