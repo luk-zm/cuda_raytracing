@@ -259,13 +259,13 @@ b32 vec3_to_unit_vec_test() {
 i64 timer_start_ns() {
   struct timespec time;
   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
-  return time.tv_sec * 1e6 + time.tv_nsec;
+  return time.tv_sec * 1000000 + time.tv_nsec;
 }
 
 i64 timer_stop_ns(i64 start_time) {
   struct timespec time;
   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
-  return time.tv_sec * 1e6 + time.tv_nsec - start_time;
+  return time.tv_sec * 1000000 + time.tv_nsec - start_time;
 }
 
 f64 timer_start_ms() {
