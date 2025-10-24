@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <time.h>
+
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -180,7 +182,46 @@ vec3 Color(f32 x, f32 y, f32 z) {
   return result;
 }
 
+f32 hit_sphere(vec3 sphere_loc, float radius, vec3 ray_origin, vec3 ray_direction) {
+  vec3 oc = vec3_sub(sphere_loc, ray_origin);
+  float a = vec3_dot_prod(ray_direction, ray_direction);
+  float b = -2.0f * vec3_dot_prod(ray_direction, oc);
+  float c = vec3_dot_prod(oc, oc) - radius * radius;
+  float discriminant = b * b - 4*a*c;
+
+  if (discriminant < 0)
+    return -1.0f;
+  else
+    return (-b - sqrtf(discriminant)) / (2.0f*a);
+}
+
+f32 hit_sphere_slower_simplified(vec3 sphere_loc, float radius, vec3 ray_origin, vec3 ray_direction) {
+  vec3 oc = vec3_sub(sphere_loc, ray_origin);
+  float direction_len = vec3_length(ray_direction);
+  float a = direction_len * direction_len;
+  float h = vec3_dot_prod(ray_direction, oc);
+  float oc_len = vec3_length(oc);
+  float c = oc_len * oc_len - radius * radius;
+  float discriminant = h*h - a * c;
+
+  if (discriminant < 0)
+    return -1.0f;
+  else
+    return (h - sqrtf(discriminant)) / a;
+}
+
+vec3 ray_at(vec3 origin, float t, vec3 direction) {
+  return vec3_add(origin, vec3_scale(t, direction));
+}
+
 vec3 ray_color(vec3 origin, vec3 direction) {
+  float t = hit_sphere(Vec3(0.0f, 0.0f, -1.0f), 0.5f, origin, direction);
+  if (t > 0.0f) {
+    vec3 normal = vec3_to_unit_vec(
+        vec3_sub(ray_at(origin, t, direction), Vec3(0.0f, 0.0f, -1.0f)));
+    return vec3_scale(0.5f, Color(normal.x + 1, normal.y + 1, normal.z + 1));
+  }
+
   vec3 unit_direction = vec3_to_unit_vec(direction);
   f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
   return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
@@ -215,6 +256,30 @@ b32 vec3_to_unit_vec_test() {
   return 1;
 }
 
+i64 timer_start_ns() {
+  struct timespec time;
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
+  return time.tv_sec * 1e6 + time.tv_nsec;
+}
+
+i64 timer_stop_ns(i64 start_time) {
+  struct timespec time;
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
+  return time.tv_sec * 1e6 + time.tv_nsec - start_time;
+}
+
+f64 timer_start_ms() {
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  return (f64)time.tv_sec * 1e3 + (f64)time.tv_nsec / 1e6;
+}
+
+f64 timer_stop_ms(f64 start_time) {
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  return (f64)time.tv_sec * 1e3 + (f64)time.tv_nsec / 1e6 - start_time;
+}
+
 i32 main() {
   vec3_to_unit_vec_test();
 
@@ -231,7 +296,7 @@ i32 main() {
 	vec3 viewport_left_upper_corner = camera_pos;
 	viewport_left_upper_corner.x -= viewport_width / 2;
 	viewport_left_upper_corner.y += viewport_height / 2;
-	viewport_left_upper_corner.z += camera_viewport_dist;
+	viewport_left_upper_corner.z -= camera_viewport_dist;
 
 	f32 pixel_dist_y = viewport_height / img_height;
 	f32 pixel_dist_x = viewport_width / img_width;
@@ -245,17 +310,20 @@ i32 main() {
 
   f32 p00x = current_pixel_center.x;
 	
+  f64 time_start = timer_start_ms();
 	for (i32 i = 0; i < img_height; ++i) {
 		for (i32 j = 0; j < img_width; ++j) {
-			rays_directions[i * img_width + j] = current_pixel_center;
-      vec3_inplace_sub(&rays_directions[i * img_width + j], camera_pos);
+      u64 curr_idx = i * img_width + j;
+			rays_directions[curr_idx] = vec3_sub(current_pixel_center, camera_pos);
 
-      pixels_colors[i * img_width + j] = ray_color(camera_pos, rays_directions[i * img_width + j]);
+      pixels_colors[curr_idx] = ray_color(camera_pos, rays_directions[curr_idx]);
       current_pixel_center.x += pixel_dist_x;
 		}
     current_pixel_center.y -= pixel_dist_y;
     current_pixel_center.x = p00x;
 	}
+  f64 time_elapsed = timer_stop_ms(time_start);
+  printf("Rendering time: %fms\n", time_elapsed);
 
   pixels_to_ppm(pixels_colors, img_width, img_height);
 }
