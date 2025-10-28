@@ -5,6 +5,8 @@
 #include <stdlib.h>
 
 #include <time.h>
+#include "vec3.h"
+#include "vec3.c" // unity build
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -17,6 +19,8 @@ typedef int64_t i64;
 typedef int32_t b32; // boolean
 typedef float f32;
 typedef double f64;
+
+const float pi = 3.1415926535897932385f;
 
 i32 char_buf_to_uint32(char *buf, i32 buf_length, u32 num) {
   if (buf_length <= 0)
@@ -41,14 +45,108 @@ i32 char_buf_to_uint32(char *buf, i32 buf_length, u32 num) {
 }
 
 typedef struct {
-	f32 x;
-	f32 y;
-	f32 z;
-} vec3;
+  vec3 point_hit;
+  vec3 normal;
+  float t;
+  b32 front_face;
+} HitRecord;
 
-vec3 Vec3(f32 x, f32 y, f32 z) {
-  vec3 result = { x, y, z };
-  return result;
+// outward_normal is of unit length
+void hit_record_set_face_normal(HitRecord *record, vec3 ray_direction, vec3 outward_normal) {
+    record->front_face = vec3_dot_prod(ray_direction, outward_normal) < 0;
+    record->normal = record->front_face ? outward_normal : vec3_sign_flip(outward_normal);
+}
+
+typedef enum {
+  VIS_OBJECT_SPHERE
+} VisObject;
+
+typedef struct {
+  vec3 center;
+  f32 radius;
+} Sphere;
+
+Sphere make_sphere(vec3 center, f32 radius) {
+  Sphere s = { center, radius };
+  return s;
+}
+
+typedef struct {
+  VisObject type;
+  union {
+    Sphere sphere;
+  };
+} Hittable;
+
+typedef struct {
+  Hittable *objects;
+  u64 count;
+} HittableList;
+
+vec3 ray_at(vec3 origin, float t, vec3 direction) {
+  return vec3_add(origin, vec3_scale(t, direction));
+}
+
+b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin, vec3 ray_direction, HitRecord *record) {
+  switch (hittable->type) {
+    case VIS_OBJECT_SPHERE: {
+      vec3 oc = vec3_sub(hittable->sphere.center, ray_origin);
+      float a = vec3_dot_prod(ray_direction, ray_direction);
+      float b = -2.0f * vec3_dot_prod(ray_direction, oc);
+      float c = vec3_dot_prod(oc, oc) - hittable->sphere.radius * hittable->sphere.radius;
+      float discriminant = b * b - 4*a*c;
+
+      if (discriminant < 0)
+        return 0;
+
+      f32 sqrt_discriminant = sqrtf(discriminant);
+      f32 root = (-b - sqrt_discriminant) / (2.0f*a);
+      if (ray_tmin >= root || root >= ray_tmax) {
+        root = (-b + sqrt_discriminant) / (2.0f*a);
+        if (ray_tmin >= root || root >= ray_tmax) {
+          return 0;
+        }
+      }
+
+      record->t = root;
+      record->point_hit = ray_at(ray_origin, root, ray_direction);
+      vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
+          vec3_sub(record->point_hit, hittable->sphere.center));
+      hit_record_set_face_normal(record, ray_direction, outward_normal);
+
+      return 1;
+    } break;
+  }
+  return 0;
+}
+
+b32 hittable_list_hit(HittableList list, vec3 ray_origin, vec3 ray_direction,
+    double ray_tmin, double ray_tmax, HitRecord *record) {
+  HitRecord temp_record;
+  b32 hit_anything = 0;
+  float closest_so_far = ray_tmax;
+
+  for (int i = 0; i < list.count; ++i) {
+    if (hit(&list.objects[i], ray_tmin, closest_so_far, ray_origin, ray_direction, &temp_record)) {
+      hit_anything = 1;
+      closest_so_far = temp_record.t;
+      *record = temp_record;
+    }
+  }
+
+  return hit_anything;
+}
+
+vec3 ray_color(vec3 origin, vec3 direction, HittableList world) {
+  HitRecord record = {0};
+  if (hittable_list_hit(world, origin, direction, 0, INFINITY, &record)) {
+    return vec3_scale(0.5f, (vec3_add(record.normal, Color(1, 1, 1))));
+  }
+
+  vec3 unit_direction = vec3_to_unit_vec(direction);
+  f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
+  return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
+      vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
 }
 
 // TODO: handle fwrite return values, consider s_fopen
@@ -88,100 +186,6 @@ void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
   fclose(img_file);
 }
 
-vec3 vec3_add(vec3 v1, vec3 v2) {
-  vec3 result = {0};
-  result.x = v1.x + v2.x;
-  result.y = v1.y + v2.y;
-  result.z = v1.z + v2.z;
-  return result;
-}
-
-vec3 vec3_sub(vec3 v1, vec3 v2) {
-  vec3 result = {0};
-  result.x = v1.x - v2.x;
-  result.y = v1.y - v2.y;
-  result.z = v1.z - v2.z;
-  return result;
-}
-
-vec3 vec3_scale(f32 scalar, vec3 v) {
-  vec3 result = {0};
-  result.x = v.x * scalar;
-  result.y = v.y * scalar;
-  result.z = v.z * scalar;
-  return result;
-}
-
-vec3 vec3_sign_flip(vec3 v) {
-  vec3 result = { -v.x, -v.y, -v.z };
-  return result;
-}
-
-vec3 *vec3_inplace_add(vec3 *v1, vec3 v2) {
-  v1->x += v2.x;
-  v1->y += v2.y;
-  v1->z += v2.z;
-  return v1;
-}
-
-vec3 *vec3_inplace_sub(vec3 *v1, vec3 v2) {
-  v1->x -= v2.x;
-  v1->y -= v2.y;
-  v1->z -= v2.z;
-  return v1;
-}
-
-vec3 *vec3_inplace_scale(f32 scalar, vec3* v) {
-  v->x *= scalar;
-  v->y *= scalar;
-  v->z *= scalar;
-  return v;
-}
-
-vec3 *vec3_inplace_sign_flip(vec3 *v) {
-  v->x = -v->x;
-  v->y = -v->y;
-  v->z = -v->z;
-  return v;
-}
-
-f32 vec3_dot_prod(vec3 v1, vec3 v2) {
-  return v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
-}
-
-vec3 vec3_cross_product(vec3 v1, vec3 v2) {
-  vec3 result = {0};
-  result.x = v1.y * v2.z - v1.z * v2.y;
-  result.y = v1.z * v2.x - v1.x * v2.z;
-  result.z = v1.x * v2.y - v1.y * v2.x;
-  return result;
-}
-
-f32 vec3_length(vec3 v) {
-	return sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
-}
-
-vec3 vec3_to_unit_vec(vec3 v) {
-	f32 v_len = vec3_length(v);
-  if (v_len == 0.0f) {
-    return Vec3(0.0f, 0.0f, 0.0f);
-  }
-
-	vec3 result = {v.x / v_len, v.y / v_len, v.z / v_len};
-	return result;
-}
-
-b32 vec3_is_same_approx(vec3 v1, vec3 v2) {
-  return (v1.x - v2.x < 0.000001f) 
-    && (v1.y - v2.y < 0.000001f)  
-    && (v1.z - v2.z < 0.000001f);
-}
-
-vec3 Color(f32 x, f32 y, f32 z) {
-  vec3 result = { x, y, z };
-  return result;
-}
-
 f32 hit_sphere(vec3 sphere_loc, float radius, vec3 ray_origin, vec3 ray_direction) {
   vec3 oc = vec3_sub(sphere_loc, ray_origin);
   float a = vec3_dot_prod(ray_direction, ray_direction);
@@ -208,24 +212,6 @@ f32 hit_sphere_slower_simplified(vec3 sphere_loc, float radius, vec3 ray_origin,
     return -1.0f;
   else
     return (h - sqrtf(discriminant)) / a;
-}
-
-vec3 ray_at(vec3 origin, float t, vec3 direction) {
-  return vec3_add(origin, vec3_scale(t, direction));
-}
-
-vec3 ray_color(vec3 origin, vec3 direction) {
-  float t = hit_sphere(Vec3(0.0f, 0.0f, -1.0f), 0.5f, origin, direction);
-  if (t > 0.0f) {
-    vec3 normal = vec3_to_unit_vec(
-        vec3_sub(ray_at(origin, t, direction), Vec3(0.0f, 0.0f, -1.0f)));
-    return vec3_scale(0.5f, Color(normal.x + 1, normal.y + 1, normal.z + 1));
-  }
-
-  vec3 unit_direction = vec3_to_unit_vec(direction);
-  f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
-  return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
-      vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
 }
 
 #define ZERO_VEC Vec3(0.0f, 0.0f, 0.0f)
@@ -283,6 +269,13 @@ f64 timer_stop_ms(f64 start_time) {
 i32 main() {
   vec3_to_unit_vec_test();
 
+  HittableList world = {0};
+  Hittable hittables[2] = { { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, 0, -1), 0.5f) }, 
+                            { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, -100.5f, -1), 100.0f)} };
+
+  world.objects = hittables;
+  world.count = 2;
+
 	i32 img_width = 400;
 	f32 img_ratio = 16.0f/9.0f;
 	i32 img_height = (int)(img_width / img_ratio);
@@ -316,7 +309,7 @@ i32 main() {
       u64 curr_idx = i * img_width + j;
 			rays_directions[curr_idx] = vec3_sub(current_pixel_center, camera_pos);
 
-      pixels_colors[curr_idx] = ray_color(camera_pos, rays_directions[curr_idx]);
+      pixels_colors[curr_idx] = ray_color(camera_pos, rays_directions[curr_idx], world);
       current_pixel_center.x += pixel_dist_x;
 		}
     current_pixel_center.y -= pixel_dist_y;
