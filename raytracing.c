@@ -22,6 +22,22 @@ typedef double f64;
 
 const float pi = 3.1415926535897932385f;
 
+f32 random_f32() {
+  return rand() / (RAND_MAX + 1.0f);
+}
+
+f32 random_f32_in_range(f32 min, f32 max) {
+  return min + (max-min)*random_f32();
+}
+
+f32 clampf(f32 val, f32 min, f32 max) {
+  if (val < min)
+    return min;
+  if (val > max)
+    return max;
+  return val;
+}
+
 i32 char_buf_to_uint32(char *buf, i32 buf_length, u32 num) {
   if (buf_length <= 0)
     return 0;
@@ -157,7 +173,7 @@ void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
     return;
   }
 
-  u64 written = fwrite("P6\n", sizeof(char), strlen("P6\n"), img_file);
+  u64 written = fwrite("P6\n", sizeof(char), 3, img_file);
   
   char pixels_width_buf[10];
   i32 pixels_width_digits = char_buf_to_uint32(pixels_width_buf, 10, pixels_width);
@@ -173,13 +189,17 @@ void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
 
   for (i32 i = 0; i < pixels_height; ++i) {
     for (i32 j = 0; j < pixels_width; ++j) {
-      u8 r = (u8)(pixels_colors[i * pixels_width + j].x * 255);
-      u8 g = (u8)(pixels_colors[i * pixels_width + j].y * 255);
-      u8 b = (u8)(pixels_colors[i * pixels_width + j].z * 255);
+      f32 r = pixels_colors[i * pixels_width + j].x;
+      f32 g = pixels_colors[i * pixels_width + j].y;
+      f32 b = pixels_colors[i * pixels_width + j].z;
+
+      u8 rbyte = (u8)(256 * clampf(r, 0.0f, 0.999f));
+      u8 gbyte = (u8)(256 * clampf(g, 0.0f, 0.999f));
+      u8 bbyte = (u8)(256 * clampf(b, 0.0f, 0.999f));
       // i32 bgr = (b << 16) | (g << 8) | r;
-      fwrite(&r, sizeof(r), 1, img_file);
-      fwrite(&g, sizeof(g), 1, img_file);
-      fwrite(&b, sizeof(b), 1, img_file);
+      fwrite(&rbyte, sizeof(rbyte), 1, img_file);
+      fwrite(&gbyte, sizeof(gbyte), 1, img_file);
+      fwrite(&bbyte, sizeof(bbyte), 1, img_file);
     }
   }
 
@@ -276,6 +296,9 @@ i32 main() {
   world.objects = hittables;
   world.count = 2;
 
+  i32 samples_per_pixel = 10;
+  f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
+
 	i32 img_width = 400;
 	f32 img_ratio = 16.0f/9.0f;
 	i32 img_height = (int)(img_width / img_ratio);
@@ -307,9 +330,16 @@ i32 main() {
 	for (i32 i = 0; i < img_height; ++i) {
 		for (i32 j = 0; j < img_width; ++j) {
       u64 curr_idx = i * img_width + j;
-			rays_directions[curr_idx] = vec3_sub(current_pixel_center, camera_pos);
+      for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
+        f32 x_offset = random_f32() - 0.5f;
+        f32 y_offset = random_f32() - 0.5f;
+        rays_directions[curr_idx] = vec3_sub(current_pixel_center, camera_pos);
+        rays_directions[curr_idx].x += x_offset * pixel_dist_x;
+        rays_directions[curr_idx].y += y_offset * pixel_dist_y;
 
-      pixels_colors[curr_idx] = ray_color(camera_pos, rays_directions[curr_idx], world);
+        vec3_inplace_add(&pixels_colors[curr_idx], ray_color(camera_pos, rays_directions[curr_idx], world));
+      }
+      vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
       current_pixel_center.x += pixel_dist_x;
 		}
     current_pixel_center.y -= pixel_dist_y;
