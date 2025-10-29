@@ -262,6 +262,7 @@ b32 vec3_to_unit_vec_test() {
   return 1;
 }
 
+#if LINUX
 i64 timer_start_ns() {
   struct timespec time;
   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
@@ -285,6 +286,42 @@ f64 timer_stop_ms(f64 start_time) {
   clock_gettime(CLOCK_MONOTONIC, &time);
   return (f64)time.tv_sec * 1e3 + (f64)time.tv_nsec / 1e6 - start_time;
 }
+#elif WINDOWS
+#include <intrin.h>
+#include <windows.h>
+
+LARGE_INTEGER freq;
+
+f64 timer_start_ns() {
+  return (f64)__rdtsc();
+}
+
+f64 timer_stop_ns(f64 start_time) {
+  return (__rdtsc() - start_time) / 3.7;
+}
+
+f64 timer_start_ms() {
+  return (f64)__rdtsc();
+}
+
+f64 timer_stop_ms(f64 start_time) {
+  return ((f64)__rdtsc() - start_time) / 3700000.0;
+}
+
+u64 timer_start() {
+  QueryPerformanceFrequency(&freq);
+  LARGE_INTEGER ticks;
+  QueryPerformanceCounter(&ticks);
+  return ticks.QuadPart;
+}
+
+f64 timer_stop(u64 start_time) {
+  LARGE_INTEGER ticks;
+  QueryPerformanceCounter(&ticks);
+  return (f64)(ticks.QuadPart - start_time) / (f64)freq.QuadPart;
+}
+
+#endif
 
 i32 main() {
   vec3_to_unit_vec_test();
@@ -321,23 +358,25 @@ i32 main() {
 	current_pixel_center.x += 0.5 * pixel_dist_x;
 	current_pixel_center.y -= 0.5 * pixel_dist_y;
 	
-  vec3 *rays_directions = calloc(img_height * img_width, sizeof(vec3));
+  vec3 current_ray_direction = {0};
   vec3 *pixels_colors = calloc(img_height * img_width, sizeof(vec3));
 
   f32 p00x = current_pixel_center.x;
 	
   f64 time_start = timer_start_ms();
+  u64 time_start_s = timer_start();
 	for (i32 i = 0; i < img_height; ++i) {
 		for (i32 j = 0; j < img_width; ++j) {
       u64 curr_idx = i * img_width + j;
       for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
         f32 x_offset = random_f32() - 0.5f;
         f32 y_offset = random_f32() - 0.5f;
-        rays_directions[curr_idx] = vec3_sub(current_pixel_center, camera_pos);
-        rays_directions[curr_idx].x += x_offset * pixel_dist_x;
-        rays_directions[curr_idx].y += y_offset * pixel_dist_y;
+        current_ray_direction = vec3_sub(current_pixel_center, camera_pos);
+        current_ray_direction.x += x_offset * pixel_dist_x;
+        current_ray_direction.y += y_offset * pixel_dist_y;
 
-        vec3_inplace_add(&pixels_colors[curr_idx], ray_color(camera_pos, rays_directions[curr_idx], world));
+        vec3_inplace_add(&pixels_colors[curr_idx],
+            ray_color(camera_pos, current_ray_direction, world));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
       current_pixel_center.x += pixel_dist_x;
@@ -347,6 +386,8 @@ i32 main() {
 	}
   f64 time_elapsed = timer_stop_ms(time_start);
   printf("Rendering time: %fms\n", time_elapsed);
+  f64 time_elapsed_s = timer_stop(time_start_s);
+  printf("Rendering time: %fs\n", time_elapsed_s);
 
   pixels_to_ppm(pixels_colors, img_width, img_height);
 }
