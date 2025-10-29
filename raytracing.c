@@ -106,17 +106,26 @@ b32 hittable_list_hit(HittableList list, vec3 ray_origin, vec3 ray_direction,
   return hit_anything;
 }
 
-vec3 ray_color(vec3 origin, vec3 direction, HittableList world) {
+vec3 ray_color(vec3 origin, vec3 direction, i32 max_bounces, HittableList world) {
+  if (max_bounces <= 0)
+    return Color(0, 0, 0);
+
   HitRecord record = {0};
-  if (hittable_list_hit(world, origin, direction, 0, INFINITY, &record)) {
-    vec3 direction = vec3_random_on_hemisphere(record.normal);
-    return vec3_scale(0.5f, ray_color(record.point_hit, direction, world));
+  if (hittable_list_hit(world, origin, direction, 0.001f, INFINITY, &record)) {
+    vec3 direction = vec3_add(record.normal, vec3_random_unit_vector());
+    return vec3_scale(0.5f, ray_color(record.point_hit, direction, max_bounces - 1, world));
   }
 
   vec3 unit_direction = vec3_to_unit_vec(direction);
   f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
   return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
       vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
+}
+
+f32 linear_to_gamma(f32 linear_component) {
+  if (linear_component > 0)
+    return sqrtf(linear_component);
+  return 0.0f;
 }
 
 // TODO: handle fwrite return values, consider s_fopen
@@ -143,9 +152,9 @@ void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
 
   for (i32 i = 0; i < pixels_height; ++i) {
     for (i32 j = 0; j < pixels_width; ++j) {
-      f32 r = pixels_colors[i * pixels_width + j].x;
-      f32 g = pixels_colors[i * pixels_width + j].y;
-      f32 b = pixels_colors[i * pixels_width + j].z;
+      f32 r = linear_to_gamma(pixels_colors[i * pixels_width + j].x);
+      f32 g = linear_to_gamma(pixels_colors[i * pixels_width + j].y);
+      f32 b = linear_to_gamma(pixels_colors[i * pixels_width + j].z);
 
       u8 rbyte = (u8)(256 * clampf(r, 0.0f, 0.999f));
       u8 gbyte = (u8)(256 * clampf(g, 0.0f, 0.999f));
@@ -302,6 +311,7 @@ i32 main() {
 
   i32 samples_per_pixel = 100;
   f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
+  i32 max_bounces = 50;
 
 	i32 img_width = 400;
 	f32 img_ratio = 16.0f/9.0f;
@@ -343,7 +353,7 @@ i32 main() {
         current_ray_direction.y += y_offset * pixel_dist_y;
 
         vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(camera_pos, current_ray_direction, world));
+            ray_color(camera_pos, current_ray_direction, max_bounces, world));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
       current_pixel_center.x += pixel_dist_x;
