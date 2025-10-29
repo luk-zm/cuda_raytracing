@@ -3,62 +3,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
-
 #include <time.h>
-#include "vec3.h"
-#include "vec3.c" // unity build
 
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-typedef int8_t i8;
-typedef int16_t i16;
-typedef int32_t i32;
-typedef int64_t i64;
-typedef int32_t b32; // boolean
-typedef float f32;
-typedef double f64;
+#include "vec3.h"
+#include "utility.h"
+
+#include "vec3.c" // unity build
+#include "utility.c"
 
 const float pi = 3.1415926535897932385f;
-
-f32 random_f32() {
-  return rand() / (RAND_MAX + 1.0f);
-}
-
-f32 random_f32_in_range(f32 min, f32 max) {
-  return min + (max-min)*random_f32();
-}
-
-f32 clampf(f32 val, f32 min, f32 max) {
-  if (val < min)
-    return min;
-  if (val > max)
-    return max;
-  return val;
-}
-
-i32 char_buf_to_uint32(char *buf, i32 buf_length, u32 num) {
-  if (buf_length <= 0)
-    return 0;
-
-  buf[0] = '0' + num % 10;
-  num /= 10;
-  i32 i;
-  for (i = 1; i < buf_length && num != 0; ++i) {
-    buf[i] = '0' + num % 10;
-    num /= 10;
-  }
-
-  i32 number_of_digits = i;
-  for (i = 0; i < number_of_digits / 2; ++i) {
-    char temp = buf[i];
-    buf[i] = buf[number_of_digits - i - 1];
-    buf[number_of_digits - i - 1] = temp;
-  }
-
-  return number_of_digits;
-}
 
 typedef struct {
   vec3 point_hit;
@@ -156,7 +109,8 @@ b32 hittable_list_hit(HittableList list, vec3 ray_origin, vec3 ray_direction,
 vec3 ray_color(vec3 origin, vec3 direction, HittableList world) {
   HitRecord record = {0};
   if (hittable_list_hit(world, origin, direction, 0, INFINITY, &record)) {
-    return vec3_scale(0.5f, (vec3_add(record.normal, Color(1, 1, 1))));
+    vec3 direction = vec3_random_on_hemisphere(record.normal);
+    return vec3_scale(0.5f, ray_color(record.point_hit, direction, world));
   }
 
   vec3 unit_direction = vec3_to_unit_vec(direction);
@@ -265,13 +219,13 @@ b32 vec3_to_unit_vec_test() {
 #if LINUX
 i64 timer_start_ns() {
   struct timespec time;
-  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
+  clock_gettime(CLOCK_MONOTONIC, &time);
   return time.tv_sec * 1000000 + time.tv_nsec;
 }
 
 i64 timer_stop_ns(i64 start_time) {
   struct timespec time;
-  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
+  clock_gettime(CLOCK_MONOTONIC, &time);
   return time.tv_sec * 1000000 + time.tv_nsec - start_time;
 }
 
@@ -286,6 +240,19 @@ f64 timer_stop_ms(f64 start_time) {
   clock_gettime(CLOCK_MONOTONIC, &time);
   return (f64)time.tv_sec * 1e3 + (f64)time.tv_nsec / 1e6 - start_time;
 }
+
+f64 timer_start() {
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  return (f64)time.tv_sec + (f64)time.tv_nsec / 1000000000.0;
+}
+
+f64 timer_stop(f64 start_time) {
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  return ((f64)time.tv_sec + (f64)time.tv_nsec / 1000000000.0) - start_time;
+}
+
 #elif WINDOWS
 #include <intrin.h>
 #include <windows.h>
@@ -333,7 +300,7 @@ i32 main() {
   world.objects = hittables;
   world.count = 2;
 
-  i32 samples_per_pixel = 10;
+  i32 samples_per_pixel = 100;
   f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
 
 	i32 img_width = 400;
@@ -364,7 +331,7 @@ i32 main() {
   f32 p00x = current_pixel_center.x;
 	
   f64 time_start = timer_start_ms();
-  u64 time_start_s = timer_start();
+  f64 time_start_s = timer_start();
 	for (i32 i = 0; i < img_height; ++i) {
 		for (i32 j = 0; j < img_width; ++j) {
       u64 curr_idx = i * img_width + j;

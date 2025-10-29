@@ -22,9 +22,7 @@ typedef struct {
 } vec3;
 
 vec3 Vec3(f32 x, f32 y, f32 z);
-
 vec3 Color(f32 x, f32 y, f32 z);
-
 vec3 vec3_add(vec3 v1, vec3 v2);
 vec3 vec3_sub(vec3 v1, vec3 v2);
 vec3 vec3_scale(f32 scalar, vec3 v);
@@ -38,5 +36,9 @@ vec3 vec3_cross_product(vec3 v1, vec3 v2);
 f32 vec3_length(vec3 v);
 vec3 vec3_to_unit_vec(vec3 v);
 b32 vec3_is_same_approx(vec3 v1, vec3 v2);
+vec3 vec3_random();
+vec3 vec3_random_bound(f32 min, f32 max);
+vec3 vec3_random_unit_vector();
+vec3 vec3_random_on_hemisphere(vec3 normal);
 
 #endif

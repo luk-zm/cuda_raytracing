@@ -1,6 +1,7 @@
 #include <math.h>
  
 #include "vec3.h"
+#include "utility.h"
 
 vec3 Vec3(f32 x, f32 y, f32 z) {
   vec3 result = { x, y, z };
@@ -101,3 +102,28 @@ b32 vec3_is_same_approx(vec3 v1, vec3 v2) {
     && (v1.z - v2.z < 0.000001f);
 }
 
+vec3 vec3_random() {
+  return Vec3(random_f32(), random_f32(), random_f32());
+}
+
+vec3 vec3_random_bound(f32 min, f32 max) {
+  return Vec3(random_f32_bound(min, max), random_f32_bound(min, max), random_f32_bound(min, max));
+}
+
+vec3 vec3_random_unit_vector() {
+  while (1) {
+    vec3 rand = vec3_random_bound(-1.0f, 1.0f);
+    f32 rand_len = vec3_length(rand);
+    f32 rand_len_squared = rand_len * rand_len;
+    if (1e-50 < rand_len_squared && rand_len_squared <= 1.0f)
+      return vec3_scale(1.0f/rand_len, rand);
+  }
+}
+
+vec3 vec3_random_on_hemisphere(vec3 normal) {
+  vec3 on_unit_sphere = vec3_random_unit_vector();
+  if (vec3_dot_prod(on_unit_sphere, normal) > 0.0f)
+    return on_unit_sphere;
+  else
+    return vec3_sign_flip(on_unit_sphere);
+}
