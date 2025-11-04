@@ -13,11 +13,31 @@
 
 const float pi = 3.1415926535897932385f;
 
+typedef enum {
+  MATERIAL_METAL,
+  MATERIAL_LAMBERTIAN
+} MaterialType;
+
+typedef struct Material {
+  MaterialType type;
+  union {
+    vec3 lambertian_albedo;
+  };
+} Material;
+
+Material make_lambertian(vec3 albedo) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  result.lambertian_albedo = albedo;
+  return result;
+}
+
 typedef struct {
   vec3 point_hit;
   vec3 normal;
   float t;
   b32 front_face;
+  Material mat;
 } HitRecord;
 
 // outward_normal is of unit length
@@ -33,10 +53,11 @@ typedef enum {
 typedef struct {
   vec3 center;
   f32 radius;
+  Material mat;
 } Sphere;
 
-Sphere make_sphere(vec3 center, f32 radius) {
-  Sphere s = { center, radius };
+Sphere make_sphere(vec3 center, f32 radius, Material mat) {
+  Sphere s = { center, radius, mat };
   return s;
 }
 
@@ -56,7 +77,8 @@ vec3 ray_at(vec3 origin, float t, vec3 direction) {
   return vec3_add(origin, vec3_scale(t, direction));
 }
 
-b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin, vec3 ray_direction, HitRecord *record) {
+b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin,
+    vec3 ray_direction, HitRecord *record) {
   switch (hittable->type) {
     case VIS_OBJECT_SPHERE: {
       vec3 oc = vec3_sub(hittable->sphere.center, ray_origin);
@@ -79,6 +101,7 @@ b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin, vec
 
       record->t = root;
       record->point_hit = ray_at(ray_origin, root, ray_direction);
+      record->mat = hittable->sphere.mat;
       vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
           vec3_sub(record->point_hit, hittable->sphere.center));
       hit_record_set_face_normal(record, ray_direction, outward_normal);
@@ -106,14 +129,40 @@ b32 hittable_list_hit(HittableList list, vec3 ray_origin, vec3 ray_direction,
   return hit_anything;
 }
 
+typedef struct {
+  b32 is_hit;
+  vec3 direction;
+  vec3 attenuation;
+} ScatterRes;
+
+ScatterRes material_scatter(Material *mat, vec3 normal) {
+  ScatterRes result = {0};
+  switch (mat->type) {
+    case MATERIAL_LAMBERTIAN: {
+      result.is_hit = 1;
+      result.direction = vec3_add(normal, vec3_random_unit_vector());
+      result.attenuation = mat->lambertian_albedo;
+    } break;
+    case MATERIAL_METAL: {
+
+    } break;
+  }
+  return result;
+}
+
 vec3 ray_color(vec3 origin, vec3 direction, i32 max_bounces, HittableList world) {
   if (max_bounces <= 0)
     return Color(0, 0, 0);
 
   HitRecord record = {0};
   if (hittable_list_hit(world, origin, direction, 0.001f, INFINITY, &record)) {
-    vec3 direction = vec3_add(record.normal, vec3_random_unit_vector());
-    return vec3_scale(0.5f, ray_color(record.point_hit, direction, max_bounces - 1, world));
+    ScatterRes scatter = material_scatter(&record.mat, record.normal);
+    if (scatter.is_hit) {
+      return vec3_comp_scale(scatter.attenuation,
+          ray_color(record.point_hit, scatter.direction, max_bounces - 1, world));
+    } else {
+      return Color(0, 0, 0);
+    }
   }
 
   vec3 unit_direction = vec3_to_unit_vec(direction);
@@ -303,8 +352,10 @@ i32 main() {
   vec3_to_unit_vec_test();
 
   HittableList world = {0};
-  Hittable hittables[2] = { { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, 0, -1), 0.5f) }, 
-                            { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, -100.5f, -1), 100.0f)} };
+  Material default_mat = make_lambertian(Vec3(0.5f, 0.5f, 0.5f));
+  Hittable hittables[2] = { 
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, 0, -1), 0.5f, default_mat ) }, 
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, -100.5f, -1), 100.0f, default_mat)} };
 
   world.objects = hittables;
   world.count = 2;

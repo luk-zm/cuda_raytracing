@@ -127,3 +127,8 @@ vec3 vec3_random_on_hemisphere(vec3 normal) {
   else
     return vec3_sign_flip(on_unit_sphere);
 }
+
+vec3 vec3_comp_scale(vec3 v1, vec3 v2) {
+  vec3 result = Vec3(v1.x * v2.x, v1.y * v2.y, v1.z * v2.z);
+  return result;
+}
