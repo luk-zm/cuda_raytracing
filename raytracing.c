@@ -15,13 +15,21 @@ const float pi = 3.1415926535897932385f;
 
 typedef enum {
   MATERIAL_METAL,
-  MATERIAL_LAMBERTIAN
+  MATERIAL_LAMBERTIAN,
+  MATERIAL_DIELECTRIC
 } MaterialType;
 
 typedef struct Material {
   MaterialType type;
   union {
     vec3 lambertian_albedo;
+    struct {
+      vec3 albedo;
+      f32 fuzz;
+    } metal;
+    struct {
+      f32 refraction_index;
+    } dielectric;
   };
 } Material;
 
@@ -32,18 +40,33 @@ Material make_lambertian(vec3 albedo) {
   return result;
 }
 
+Material make_metal(vec3 albedo, f32 fuzz) {
+  Material result = {0};
+  result.type = MATERIAL_METAL;
+  result.metal.albedo = albedo;
+  result.metal.fuzz = fuzz;
+  return result;
+}
+
+Material make_dielectric(f32 refraction_index) {
+  Material result = {0};
+  result.type = MATERIAL_DIELECTRIC;
+  result.dielectric.refraction_index = refraction_index;
+  return result;
+}
+
 typedef struct {
   vec3 point_hit;
   vec3 normal;
   float t;
-  b32 front_face;
+  b32 is_front_face;
   Material mat;
 } HitRecord;
 
 // outward_normal is of unit length
 void hit_record_set_face_normal(HitRecord *record, vec3 ray_direction, vec3 outward_normal) {
-    record->front_face = vec3_dot_prod(ray_direction, outward_normal) < 0;
-    record->normal = record->front_face ? outward_normal : vec3_sign_flip(outward_normal);
+    record->is_front_face = vec3_dot_prod(ray_direction, outward_normal) < 0;
+    record->normal = record->is_front_face ? outward_normal : vec3_sign_flip(outward_normal);
 }
 
 typedef enum {
@@ -129,22 +152,64 @@ b32 hittable_list_hit(HittableList list, vec3 ray_origin, vec3 ray_direction,
   return hit_anything;
 }
 
+vec3 refract(vec3 uv, vec3 n, f32 etai_over_etat) {
+  f32 cos_theta = fmin(vec3_dot_prod(vec3_sign_flip(uv), n), 1.0f);
+  vec3 r_out_perpendicular = vec3_scale(etai_over_etat, vec3_add(uv, vec3_scale(cos_theta, n)));
+  f32 r_out_perp_len = vec3_length(r_out_perpendicular);
+  vec3 r_out_parallel = vec3_scale(-sqrtf(fabsf(1.0f - r_out_perp_len * r_out_perp_len)), n);
+  return vec3_add(r_out_perpendicular, r_out_parallel);
+}
+
+vec3 reflect(vec3 direction, vec3 normal) {
+  vec3 reflected = vec3_sub(direction,
+      vec3_scale(2.0f * vec3_dot_prod(direction, normal), normal));
+  return reflected;
+}
+
+f32 reflectance(f32 cos, f32 refraction_index) {
+  /* Use Shlick's approximation */
+  f32 r0 = (1.0f - refraction_index) / (1.0f + refraction_index);
+  r0 = r0 * r0;
+  return r0 + (1.0f - r0) * powf(1.0f - cos, 5.0f);
+}
+
 typedef struct {
   b32 is_hit;
   vec3 direction;
   vec3 attenuation;
 } ScatterRes;
 
-ScatterRes material_scatter(Material *mat, vec3 normal) {
+ScatterRes material_scatter(Material *mat, vec3 r_in_direction, vec3 normal, b32 is_front_face) {
   ScatterRes result = {0};
   switch (mat->type) {
     case MATERIAL_LAMBERTIAN: {
       result.is_hit = 1;
       result.direction = vec3_add(normal, vec3_random_unit_vector());
+      if (vec3_is_near_zero(result.direction))
+        result.direction = normal;
       result.attenuation = mat->lambertian_albedo;
     } break;
     case MATERIAL_METAL: {
+      vec3 reflected = reflect(r_in_direction, normal);
+      result.direction = vec3_add(vec3_to_unit_vec(reflected),
+          vec3_scale(mat->metal.fuzz, vec3_random_unit_vector()));
+      result.attenuation = mat->metal.albedo;
+      result.is_hit = vec3_dot_prod(result.direction, normal) > 0;
+    } break;
+    case MATERIAL_DIELECTRIC: {
+      result.attenuation = Color(1.0f, 1.0f, 1.0f);
+      f32 ri =
+        is_front_face ? (1.0f / mat->dielectric.refraction_index) : mat->dielectric.refraction_index;
+      vec3 unit_direction = vec3_to_unit_vec(r_in_direction);
+      f32 cos_theta = fmin(vec3_dot_prod(vec3_sign_flip(unit_direction), normal), 1.0f);
+      f32 sin_theta = sqrtf(1.0f - cos_theta * cos_theta);
 
+      b32 is_unable_to_refract = ri * sin_theta > 1.0f;
+      if (is_unable_to_refract || reflectance(cos_theta, ri) > random_f32())
+        result.direction = reflect(unit_direction, normal);
+      else
+        result.direction = refract(unit_direction, normal, ri);
+      result.is_hit = 1;
     } break;
   }
   return result;
@@ -156,7 +221,7 @@ vec3 ray_color(vec3 origin, vec3 direction, i32 max_bounces, HittableList world)
 
   HitRecord record = {0};
   if (hittable_list_hit(world, origin, direction, 0.001f, INFINITY, &record)) {
-    ScatterRes scatter = material_scatter(&record.mat, record.normal);
+    ScatterRes scatter = material_scatter(&record.mat, direction, record.normal, record.is_front_face);
     if (scatter.is_hit) {
       return vec3_comp_scale(scatter.attenuation,
           ray_color(record.point_hit, scatter.direction, max_bounces - 1, world));
@@ -351,25 +416,39 @@ f64 timer_stop(u64 start_time) {
 i32 main() {
   vec3_to_unit_vec_test();
 
+  Material material_ground = make_lambertian(Color(0.8f, 0.8f, 0.0f));
+  Material material_center = make_lambertian(Color(0.1f, 0.2f, 0.5f));
+  /* Material material_left = make_metal(Color(0.8f, 0.8f, 0.8f), 0.3f); */
+  Material material_bubble = make_dielectric(1.0f / 1.5f);
+  Material material_left = make_dielectric(1.5f);
+  Material material_right = make_metal(Color(0.8f, 0.6f, 0.2f), 1.0f);
+
   HittableList world = {0};
   Material default_mat = make_lambertian(Vec3(0.5f, 0.5f, 0.5f));
-  Hittable hittables[2] = { 
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, 0, -1), 0.5f, default_mat ) }, 
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, -100.5f, -1), 100.0f, default_mat)} };
+  Hittable hittables[5] = { 
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, 0, -1.2f), 0.5f, material_center) }, 
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, -100.5f, -1), 100.0f, material_ground) },
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(-1.0f, 0.0f, -1.0f), 0.5f, material_left) },
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(1.0f, 0.0f, -1.0f), 0.5f, material_right) },
+    { VIS_OBJECT_SPHERE, make_sphere(Vec3(-1.0f, 0.0f, -1.0f), 0.4f, material_bubble) } };
 
   world.objects = hittables;
-  world.count = 2;
+  world.count = 5;
 
-  i32 samples_per_pixel = 100;
+  i32 samples_per_pixel = 10;
   f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
   i32 max_bounces = 50;
+
+  f32 vfov = 90.0f;
 
 	i32 img_width = 400;
 	f32 img_ratio = 16.0f/9.0f;
 	i32 img_height = (int)(img_width / img_ratio);
 	
 	f32 camera_viewport_dist = 1.0f;
-	f32 viewport_height = 2.0f;
+  f32 theta = vfov * (pi / 180.0f);
+  f32 h = tanf(theta / 2.0f);
+	f32 viewport_height = 2.0f * h * camera_viewport_dist;
 	f32 viewport_ratio = (f32)img_width /  (f32)img_height;
 	f32 viewport_width = viewport_height * viewport_ratio;
 	vec3 camera_pos = { 0.0f, 0.0f, 0.0f };

@@ -132,3 +132,8 @@ vec3 vec3_comp_scale(vec3 v1, vec3 v2) {
   vec3 result = Vec3(v1.x * v2.x, v1.y * v2.y, v1.z * v2.z);
   return result;
 }
+
+b32 vec3_is_near_zero(vec3 v) {
+  f32 s = 1e-8;
+  return fabsf(v.x) < s && fabsf(v.y) < s && fabsf(v.z) < s;
+}

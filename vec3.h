@@ -41,5 +41,6 @@ vec3 vec3_random_bound(f32 min, f32 max);
 vec3 vec3_random_unit_vector();
 vec3 vec3_random_on_hemisphere(vec3 normal);
 vec3 vec3_comp_scale(vec3 v1, vec3 v2);
+b32 vec3_is_near_zero(vec3 v);
 
 #endif
