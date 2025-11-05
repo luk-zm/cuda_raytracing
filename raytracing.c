@@ -440,56 +440,64 @@ i32 main() {
   i32 max_bounces = 50;
 
   f32 vfov = 90.0f;
+  vec3 lookfrom = Vec3(-2.0f, 2.0f, 1.0f);
+  vec3 lookat = Vec3(0.0f, 0.0f, -1.0f);
+  vec3 view_up = Vec3(0.0f, 1.0f, 0.0f);
 
 	i32 img_width = 400;
 	f32 img_ratio = 16.0f/9.0f;
 	i32 img_height = (int)(img_width / img_ratio);
 	
-	f32 camera_viewport_dist = 1.0f;
+	f32 camera_viewport_dist = vec3_length(vec3_sub(lookfrom, lookat));
   f32 theta = vfov * (pi / 180.0f);
   f32 h = tanf(theta / 2.0f);
 	f32 viewport_height = 2.0f * h * camera_viewport_dist;
 	f32 viewport_ratio = (f32)img_width /  (f32)img_height;
 	f32 viewport_width = viewport_height * viewport_ratio;
-	vec3 camera_pos = { 0.0f, 0.0f, 0.0f };
+	vec3 camera_pos = lookfrom;
+
+  vec3 cam_w = vec3_to_unit_vec(vec3_sub(lookfrom, lookat));
+  vec3 cam_u = vec3_to_unit_vec(vec3_cross_product(view_up, cam_w));
+  vec3 cam_v = vec3_cross_product(cam_w, cam_u);
+	
+  vec3 viewport_v = vec3_scale(viewport_height, vec3_sign_flip(cam_v));
+  vec3 viewport_u = vec3_scale(viewport_width, cam_u);
+
+  vec3 pixel_delta_v = vec3_scale(1.0f/(f32)img_height, viewport_v);
+  vec3 pixel_delta_u = vec3_scale(1.0f/(f32)img_width, viewport_u);
 	
 	vec3 viewport_left_upper_corner = camera_pos;
-	viewport_left_upper_corner.x -= viewport_width / 2;
-	viewport_left_upper_corner.y += viewport_height / 2;
-	viewport_left_upper_corner.z -= camera_viewport_dist;
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(camera_viewport_dist, cam_w));
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_u));
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_v));
 
-	f32 pixel_dist_y = viewport_height / img_height;
-	f32 pixel_dist_x = viewport_width / img_width;
-	
 	vec3 current_pixel_center = viewport_left_upper_corner;
-	current_pixel_center.x += 0.5 * pixel_dist_x;
-	current_pixel_center.y -= 0.5 * pixel_dist_y;
+  vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_v));
+  vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_u));
 	
-  vec3 current_ray_direction = {0};
   vec3 *pixels_colors = calloc(img_height * img_width, sizeof(vec3));
 
-  f32 p00x = current_pixel_center.x;
-	
   f64 time_start = timer_start_ms();
   f64 time_start_s = timer_start();
 	for (i32 i = 0; i < img_height; ++i) {
 		for (i32 j = 0; j < img_width; ++j) {
       u64 curr_idx = i * img_width + j;
+      vec3 current_ray_direction = vec3_sub(vec3_add(
+          current_pixel_center, vec3_add(
+            vec3_scale((f32)i, pixel_delta_v),
+            vec3_scale((f32)j, pixel_delta_u))), camera_pos);
       for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
         f32 x_offset = random_f32() - 0.5f;
         f32 y_offset = random_f32() - 0.5f;
-        current_ray_direction = vec3_sub(current_pixel_center, camera_pos);
-        current_ray_direction.x += x_offset * pixel_dist_x;
-        current_ray_direction.y += y_offset * pixel_dist_y;
+        vec3 sampling_ray = current_ray_direction;
+        vec3_inplace_add(&sampling_ray, vec3_scale(x_offset, pixel_delta_u));
+        vec3_inplace_add(&sampling_ray, vec3_scale(y_offset, pixel_delta_v));
 
         vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(camera_pos, current_ray_direction, max_bounces, world));
+            ray_color(camera_pos, sampling_ray, max_bounces, world));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
-      current_pixel_center.x += pixel_dist_x;
 		}
-    current_pixel_center.y -= pixel_dist_y;
-    current_pixel_center.x = p00x;
 	}
   f64 time_elapsed = timer_stop_ms(time_start);
   printf("Rendering time: %fms\n", time_elapsed);

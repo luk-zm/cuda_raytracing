@@ -4,5 +4,5 @@ all: raytracing.c
 rel: raytracing.c
 	gcc -DLINUX -lm raytracing.c -O3 -o bin/raytracer
 
-run: all
+run: rel
 	cd bin && ./raytracer
