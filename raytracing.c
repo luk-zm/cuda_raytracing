@@ -413,6 +413,21 @@ f64 timer_stop(u64 start_time) {
 
 #endif
 
+vec3 random_in_unit_disk() {
+  while (1) {
+    vec3 rand = Vec3(random_f32_bound(-1.0f, 1.0f), random_f32_bound(-1.0f, 1.0f), 0.0f);
+    f32 rand_len = vec3_length(rand);
+    if (rand_len * rand_len < 1.0f)
+      return rand;
+  }
+}
+
+vec3 defocus_disk_sample(vec3 center, vec3 defocus_disk_u, vec3 defocus_disk_v) {
+  vec3 p = random_in_unit_disk();
+  return vec3_add(
+      center, vec3_add(vec3_scale(p.x, defocus_disk_u), vec3_scale(p.y, defocus_disk_v)));
+}
+
 i32 main() {
   vec3_to_unit_vec_test();
 
@@ -435,11 +450,11 @@ i32 main() {
   world.objects = hittables;
   world.count = 5;
 
-  i32 samples_per_pixel = 10;
+  i32 samples_per_pixel = 100;
   f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
   i32 max_bounces = 50;
 
-  f32 vfov = 90.0f;
+  f32 vfov = 20.0f;
   vec3 lookfrom = Vec3(-2.0f, 2.0f, 1.0f);
   vec3 lookat = Vec3(0.0f, 0.0f, -1.0f);
   vec3 view_up = Vec3(0.0f, 1.0f, 0.0f);
@@ -448,10 +463,12 @@ i32 main() {
 	f32 img_ratio = 16.0f/9.0f;
 	i32 img_height = (int)(img_width / img_ratio);
 	
-	f32 camera_viewport_dist = vec3_length(vec3_sub(lookfrom, lookat));
+	/* f32 camera_viewport_dist = vec3_length(vec3_sub(lookfrom, lookat)); */
+  f32 defocus_angle = 10.0f;
+  f32 focus_dist = 3.4f;
   f32 theta = vfov * (pi / 180.0f);
   f32 h = tanf(theta / 2.0f);
-	f32 viewport_height = 2.0f * h * camera_viewport_dist;
+	f32 viewport_height = 2.0f * h * focus_dist;
 	f32 viewport_ratio = (f32)img_width /  (f32)img_height;
 	f32 viewport_width = viewport_height * viewport_ratio;
 	vec3 camera_pos = lookfrom;
@@ -467,9 +484,13 @@ i32 main() {
   vec3 pixel_delta_u = vec3_scale(1.0f/(f32)img_width, viewport_u);
 	
 	vec3 viewport_left_upper_corner = camera_pos;
-  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(camera_viewport_dist, cam_w));
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(focus_dist, cam_w));
   vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_u));
   vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_v));
+
+  f32 defocus_radius = focus_dist * tan((defocus_angle / 2.0f) * pi / 180.0f);
+  vec3 defocus_disk_u = vec3_scale(defocus_radius, cam_u);
+  vec3 defocus_disk_v = vec3_scale(defocus_radius, cam_v);
 
 	vec3 current_pixel_center = viewport_left_upper_corner;
   vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_v));
@@ -482,19 +503,22 @@ i32 main() {
 	for (i32 i = 0; i < img_height; ++i) {
 		for (i32 j = 0; j < img_width; ++j) {
       u64 curr_idx = i * img_width + j;
-      vec3 current_ray_direction = vec3_sub(vec3_add(
-          current_pixel_center, vec3_add(
-            vec3_scale((f32)i, pixel_delta_v),
-            vec3_scale((f32)j, pixel_delta_u))), camera_pos);
+      vec3 current_ray_direction = 
+          vec3_add(
+            current_pixel_center, vec3_add(
+              vec3_scale((f32)i, pixel_delta_v),
+              vec3_scale((f32)j, pixel_delta_u)));
       for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
+        vec3 ray_origin = (defocus_angle <= 0) ?
+          camera_pos : defocus_disk_sample(camera_pos, defocus_disk_u, defocus_disk_v);
         f32 x_offset = random_f32() - 0.5f;
         f32 y_offset = random_f32() - 0.5f;
-        vec3 sampling_ray = current_ray_direction;
-        vec3_inplace_add(&sampling_ray, vec3_scale(x_offset, pixel_delta_u));
-        vec3_inplace_add(&sampling_ray, vec3_scale(y_offset, pixel_delta_v));
+        vec3 sampling_ray_direction = vec3_sub(current_ray_direction, ray_origin);
+        vec3_inplace_add(&sampling_ray_direction, vec3_scale(x_offset, pixel_delta_u));
+        vec3_inplace_add(&sampling_ray_direction, vec3_scale(y_offset, pixel_delta_v));
 
         vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(camera_pos, sampling_ray, max_bounces, world));
+            ray_color(ray_origin, sampling_ray_direction, max_bounces, world));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
 		}
