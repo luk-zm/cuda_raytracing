@@ -431,41 +431,68 @@ vec3 defocus_disk_sample(vec3 center, vec3 defocus_disk_u, vec3 defocus_disk_v) 
 i32 main() {
   vec3_to_unit_vec_test();
 
-  Material material_ground = make_lambertian(Color(0.8f, 0.8f, 0.0f));
-  Material material_center = make_lambertian(Color(0.1f, 0.2f, 0.5f));
-  /* Material material_left = make_metal(Color(0.8f, 0.8f, 0.8f), 0.3f); */
-  Material material_bubble = make_dielectric(1.0f / 1.5f);
-  Material material_left = make_dielectric(1.5f);
-  Material material_right = make_metal(Color(0.8f, 0.6f, 0.2f), 1.0f);
-
   HittableList world = {0};
   Material default_mat = make_lambertian(Vec3(0.5f, 0.5f, 0.5f));
-  Hittable hittables[5] = { 
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, 0, -1.2f), 0.5f, material_center) }, 
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(0, -100.5f, -1), 100.0f, material_ground) },
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(-1.0f, 0.0f, -1.0f), 0.5f, material_left) },
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(1.0f, 0.0f, -1.0f), 0.5f, material_right) },
-    { VIS_OBJECT_SPHERE, make_sphere(Vec3(-1.0f, 0.0f, -1.0f), 0.4f, material_bubble) } };
+  Hittable hittables[500];
 
   world.objects = hittables;
-  world.count = 5;
+  world.count = 0;
 
-  i32 samples_per_pixel = 100;
+  Material material_ground = make_lambertian(Color(0.5f, 0.5f, 0.5f));
+  Hittable ground = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, -1000.0f, 0.0f), 1000.0f, material_ground) };
+  hittables[world.count++] = ground;
+
+  for (i32 a = -11; a < 11; ++a) {
+    for (i32 b = -11; b < 11; ++b) {
+      f32 material_choice = random_f32();
+      vec3 center = { a + 0.9f*random_f32(), 0.2f, b + 0.9f*random_f32() };
+
+      if (vec3_length(vec3_sub(center, Vec3(4.0f, 0.2f, 0.0f))) > 0.9f) {
+        Material current_material;
+        if (material_choice < 0.8f) {
+          vec3 albedo = vec3_comp_scale(vec3_random(), vec3_random());
+          current_material = make_lambertian(albedo);
+        } else if (material_choice < 0.95f) {
+          vec3 albedo = vec3_random_bound(0.5f, 1.0f);
+          f32 fuzz = random_f32_bound(0.0f, 0.5f);
+          current_material = make_metal(albedo, fuzz);
+        } else {
+          current_material = make_dielectric(1.5f);
+        }
+        Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
+        hittables[world.count++] = obj;
+      }
+    }
+  }
+
+  Material mat1 = make_dielectric(1.5f);
+  Hittable big_sphere1 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, 1.0f, 0.0f), 1.0f, mat1) };
+  hittables[world.count++] = big_sphere1;
+
+  Material mat2 = make_lambertian(Vec3(0.4f, 0.2f, 0.1f));
+  Hittable big_sphere2 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(-4.0f, 1.0f, 0.0f), 1.0f, mat2) };
+  hittables[world.count++] = big_sphere2;
+
+  Material mat3 = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.0f);
+  Hittable big_sphere3 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(4.0f, 1.0f, 0.0f), 1.0f, mat3) };
+  hittables[world.count++] = big_sphere3;
+
+  i32 samples_per_pixel = 10;
   f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
   i32 max_bounces = 50;
 
   f32 vfov = 20.0f;
-  vec3 lookfrom = Vec3(-2.0f, 2.0f, 1.0f);
-  vec3 lookat = Vec3(0.0f, 0.0f, -1.0f);
+  vec3 lookfrom = Vec3(13.0f, 2.0f, 3.0f);
+  vec3 lookat = Vec3(0.0f, 0.0f, 0.0f);
   vec3 view_up = Vec3(0.0f, 1.0f, 0.0f);
 
-	i32 img_width = 400;
+	i32 img_width = 1200;
 	f32 img_ratio = 16.0f/9.0f;
 	i32 img_height = (int)(img_width / img_ratio);
 	
 	/* f32 camera_viewport_dist = vec3_length(vec3_sub(lookfrom, lookat)); */
-  f32 defocus_angle = 10.0f;
-  f32 focus_dist = 3.4f;
+  f32 defocus_angle = 0.6f;
+  f32 focus_dist = 10.0f;
   f32 theta = vfov * (pi / 180.0f);
   f32 h = tanf(theta / 2.0f);
 	f32 viewport_height = 2.0f * h * focus_dist;
