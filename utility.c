@@ -39,3 +39,17 @@ i32 char_buf_to_uint32(char *buf, i32 buf_length, u32 num) {
   return number_of_digits;
 }
 
+b32 interval_overlap(f32 x0, f32 x1, f32 y0, f32 y1) {
+  f32 shared_min = (x0 < y0 ? y0 : x0);
+  f32 shared_max = (x1 < y1 ? x1 : y1);
+  return shared_min < shared_max;
+}
+
+void interval_sort(f32 *x0, f32 *x1) {
+  if (*x0 > *x1) {
+    f32 temp = *x0;
+    *x0 = *x1;
+    *x1 = *x0;
+  }
+}
+
