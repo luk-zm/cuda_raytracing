@@ -1,6 +1,7 @@
 @echo off
 
-set FLAGS=-Od -Ob1 -FC -Z7 -nologo -DWINDOWS
+REM set FLAGS=-Od -Ob1 -FC -Z7 -nologo -DWINDOWS
+set FLAGS=-O2 -FC -Z7 -nologo -DWINDOWS
 REM -g -std=c99 -Wall -Wextra -pedantic
 REM -lmingw32
 set LIBS=shell32.lib

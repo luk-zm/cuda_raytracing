@@ -13,6 +13,21 @@
 
 const float pi = 3.1415926535897932385f;
 
+typedef struct {
+  vec3 origin;
+  vec3 direction;
+  f32 intersection_time;
+} Ray;
+
+vec3 line_at(vec3 origin, f32 t, vec3 direction) {
+  return vec3_add(origin, vec3_scale(t, direction));
+}
+
+vec3 ray_at(Ray *ray, f32 t) {
+  return line_at(ray->origin, t, ray->direction);
+}
+
+
 typedef enum {
   MATERIAL_METAL,
   MATERIAL_LAMBERTIAN,
@@ -64,9 +79,9 @@ typedef struct {
 } HitRecord;
 
 // outward_normal is of unit length
-void hit_record_set_face_normal(HitRecord *record, vec3 ray_direction, vec3 outward_normal) {
-    record->is_front_face = vec3_dot_prod(ray_direction, outward_normal) < 0;
-    record->normal = record->is_front_face ? outward_normal : vec3_sign_flip(outward_normal);
+void hit_record_set_face_normal(HitRecord *record, Ray *ray, vec3 outward_normal) {
+  record->is_front_face = vec3_dot_prod(ray->direction, outward_normal) < 0;
+  record->normal = record->is_front_face ? outward_normal : vec3_sign_flip(outward_normal);
 }
 
 typedef enum {
@@ -75,14 +90,21 @@ typedef enum {
 
 typedef struct {
   vec3 center;
+  vec3 direction;
   f32 radius;
   Material mat;
 } Sphere;
 
 Sphere make_sphere(vec3 center, f32 radius, Material mat) {
-  Sphere s = { center, radius, mat };
+  Sphere s = { center, Vec3(0.0f, 0.0f, 0.0f), radius, mat };
   return s;
 }
+
+Sphere make_moving_sphere(vec3 center, vec3 destination, f32 radius, Material mat) {
+  Sphere s = { center, destination, radius, mat };
+  return s;
+}
+
 
 typedef struct {
   VisObject type;
@@ -96,17 +118,14 @@ typedef struct {
   u64 count;
 } HittableList;
 
-vec3 ray_at(vec3 origin, float t, vec3 direction) {
-  return vec3_add(origin, vec3_scale(t, direction));
-}
-
-b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin,
-    vec3 ray_direction, HitRecord *record) {
+b32 hit(Hittable *hittable, f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *record) {
   switch (hittable->type) {
     case VIS_OBJECT_SPHERE: {
-      vec3 oc = vec3_sub(hittable->sphere.center, ray_origin);
-      float a = vec3_dot_prod(ray_direction, ray_direction);
-      float b = -2.0f * vec3_dot_prod(ray_direction, oc);
+      vec3 current_sphere_position = 
+        line_at(hittable->sphere.center, ray->intersection_time, hittable->sphere.direction);
+      vec3 oc = vec3_sub(current_sphere_position, ray->origin);
+      float a = vec3_dot_prod(ray->direction, ray->direction);
+      float b = -2.0f * vec3_dot_prod(ray->direction, oc);
       float c = vec3_dot_prod(oc, oc) - hittable->sphere.radius * hittable->sphere.radius;
       float discriminant = b * b - 4*a*c;
 
@@ -123,11 +142,11 @@ b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin,
       }
 
       record->t = root;
-      record->point_hit = ray_at(ray_origin, root, ray_direction);
+      record->point_hit = ray_at(ray, root);
       record->mat = hittable->sphere.mat;
       vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
-          vec3_sub(record->point_hit, hittable->sphere.center));
-      hit_record_set_face_normal(record, ray_direction, outward_normal);
+          vec3_sub(record->point_hit, current_sphere_position));
+      hit_record_set_face_normal(record, ray, outward_normal);
 
       return 1;
     } break;
@@ -135,14 +154,14 @@ b32 hit(Hittable *hittable, float ray_tmin, float ray_tmax, vec3 ray_origin,
   return 0;
 }
 
-b32 hittable_list_hit(HittableList list, vec3 ray_origin, vec3 ray_direction,
+b32 hittable_list_hit(HittableList list, Ray *ray,
     double ray_tmin, double ray_tmax, HitRecord *record) {
   HitRecord temp_record;
   b32 hit_anything = 0;
   float closest_so_far = ray_tmax;
 
   for (int i = 0; i < list.count; ++i) {
-    if (hit(&list.objects[i], ray_tmin, closest_so_far, ray_origin, ray_direction, &temp_record)) {
+    if (hit(&list.objects[i], ray_tmin, closest_so_far, ray, &temp_record)) {
       hit_anything = 1;
       closest_so_far = temp_record.t;
       *record = temp_record;
@@ -215,22 +234,27 @@ ScatterRes material_scatter(Material *mat, vec3 r_in_direction, vec3 normal, b32
   return result;
 }
 
-vec3 ray_color(vec3 origin, vec3 direction, i32 max_bounces, HittableList world) {
+vec3 ray_color(Ray *ray, i32 max_bounces, HittableList world) {
   if (max_bounces <= 0)
     return Color(0, 0, 0);
 
   HitRecord record = {0};
-  if (hittable_list_hit(world, origin, direction, 0.001f, INFINITY, &record)) {
-    ScatterRes scatter = material_scatter(&record.mat, direction, record.normal, record.is_front_face);
+  if (hittable_list_hit(world, ray, 0.001f, INFINITY, &record)) {
+    ScatterRes scatter = material_scatter(&record.mat, ray->direction, record.normal,
+        record.is_front_face);
     if (scatter.is_hit) {
+      Ray bounce = {0};
+      bounce.origin = record.point_hit;
+      bounce.direction = scatter.direction;
+      bounce.intersection_time = ray->intersection_time;
       return vec3_comp_scale(scatter.attenuation,
-          ray_color(record.point_hit, scatter.direction, max_bounces - 1, world));
+          ray_color(&bounce, max_bounces - 1, world));
     } else {
       return Color(0, 0, 0);
     }
   }
 
-  vec3 unit_direction = vec3_to_unit_vec(direction);
+  vec3 unit_direction = vec3_to_unit_vec(ray->direction);
   f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
   return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
       vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
@@ -452,15 +476,21 @@ i32 main() {
         if (material_choice < 0.8f) {
           vec3 albedo = vec3_comp_scale(vec3_random(), vec3_random());
           current_material = make_lambertian(albedo);
-        } else if (material_choice < 0.95f) {
-          vec3 albedo = vec3_random_bound(0.5f, 1.0f);
-          f32 fuzz = random_f32_bound(0.0f, 0.5f);
-          current_material = make_metal(albedo, fuzz);
+          vec3 sphere_direction = Vec3(0.0f, random_f32_bound(0.0f, 0.5f), 0.0f);
+          Hittable obj = { VIS_OBJECT_SPHERE, 
+            make_moving_sphere(center, sphere_direction, 0.2f, current_material) };
+          hittables[world.count++] = obj;
         } else {
-          current_material = make_dielectric(1.5f);
+          if (material_choice < 0.95f) {
+            vec3 albedo = vec3_random_bound(0.5f, 1.0f);
+            f32 fuzz = random_f32_bound(0.0f, 0.5f);
+            current_material = make_metal(albedo, fuzz);
+          } else {
+            current_material = make_dielectric(1.5f);
+          }
+          Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
+          hittables[world.count++] = obj;
         }
-        Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
-        hittables[world.count++] = obj;
       }
     }
   }
@@ -536,16 +566,18 @@ i32 main() {
               vec3_scale((f32)i, pixel_delta_v),
               vec3_scale((f32)j, pixel_delta_u)));
       for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
-        vec3 ray_origin = (defocus_angle <= 0) ?
+        Ray sampling_ray = {0};
+        sampling_ray.origin = (defocus_angle <= 0) ?
           camera_pos : defocus_disk_sample(camera_pos, defocus_disk_u, defocus_disk_v);
         f32 x_offset = random_f32() - 0.5f;
         f32 y_offset = random_f32() - 0.5f;
-        vec3 sampling_ray_direction = vec3_sub(current_ray_direction, ray_origin);
-        vec3_inplace_add(&sampling_ray_direction, vec3_scale(x_offset, pixel_delta_u));
-        vec3_inplace_add(&sampling_ray_direction, vec3_scale(y_offset, pixel_delta_v));
+        sampling_ray.direction = vec3_sub(current_ray_direction, sampling_ray.origin);
+        vec3_inplace_add(&sampling_ray.direction, vec3_scale(x_offset, pixel_delta_u));
+        vec3_inplace_add(&sampling_ray.direction, vec3_scale(y_offset, pixel_delta_v));
+        sampling_ray.intersection_time = random_f32();
 
         vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(ray_origin, sampling_ray_direction, max_bounces, world));
+            ray_color(&sampling_ray, max_bounces, world));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
 		}
