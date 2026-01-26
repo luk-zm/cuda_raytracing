@@ -11,7 +11,20 @@
 #include "vec3.c" // unity build
 #include "utility.c"
 
+#define WORLD_SIZE 500
+
 const float pi = 3.1415926535897932385f;
+
+typedef struct {
+  f32 x0, x1;
+  f32 y0, y1;
+  f32 z0, z1;
+} Aabb;
+
+typedef struct {
+  vec3 center;
+  vec3 direction;
+} MovementPath;
 
 typedef struct {
   vec3 origin;
@@ -19,20 +32,12 @@ typedef struct {
   f32 intersection_time;
 } Ray;
 
-vec3 line_at(vec3 origin, f32 t, vec3 direction) {
-  return vec3_add(origin, vec3_scale(t, direction));
-}
-
-vec3 ray_at(Ray *ray, f32 t) {
-  return line_at(ray->origin, t, ray->direction);
-}
-
-
-typedef enum {
+typedef u32 MaterialType;
+enum {
   MATERIAL_METAL,
   MATERIAL_LAMBERTIAN,
   MATERIAL_DIELECTRIC
-} MaterialType;
+};
 
 typedef struct Material {
   MaterialType type;
@@ -48,27 +53,57 @@ typedef struct Material {
   };
 } Material;
 
-Material make_lambertian(vec3 albedo) {
-  Material result = {0};
-  result.type = MATERIAL_LAMBERTIAN;
-  result.lambertian_albedo = albedo;
-  return result;
-}
+typedef struct {
+  b32 is_hit;
+  vec3 direction;
+  vec3 attenuation;
+} ScatterRes;
 
-Material make_metal(vec3 albedo, f32 fuzz) {
-  Material result = {0};
-  result.type = MATERIAL_METAL;
-  result.metal.albedo = albedo;
-  result.metal.fuzz = fuzz;
-  return result;
-}
+typedef struct {
+  MovementPath movement_path;
+  f32 radius;
+  Material mat;
+  Aabb bounding_box;
+} Sphere;
 
-Material make_dielectric(f32 refraction_index) {
-  Material result = {0};
-  result.type = MATERIAL_DIELECTRIC;
-  result.dielectric.refraction_index = refraction_index;
-  return result;
-}
+typedef struct Hittable Hittable;
+
+typedef struct {
+  Hittable *left;
+  Hittable *right;
+  Aabb bounding_box;
+} BvhNode;
+
+typedef u32 VisObject;
+enum {
+  VIS_OBJECT_SPHERE,
+  VIS_OBJECT_BVH_NODE,
+  VIS_OBJECT_HITTABLE_LIST
+};
+
+typedef struct {
+  Hittable *objects;
+  Aabb bounding_box;
+  u64 size;
+  u64 count;
+} HittableList;
+
+struct Hittable {
+  VisObject type;
+  union {
+    Sphere sphere;
+    BvhNode bvh_node;
+    HittableList hlist;
+  };
+};
+
+typedef u32 HITTABLE_LIST_COMP_TYPE;
+enum {
+  HITTABLE_LIST_COMP_TYPE_X_AXIS,
+  HITTABLE_LIST_COMP_TYPE_Y_AXIS,
+  HITTABLE_LIST_COMP_TYPE_Z_AXIS,
+  HITTABLE_LIST_COMP_TYPE_COUNT
+};
 
 typedef struct {
   vec3 point_hit;
@@ -78,97 +113,17 @@ typedef struct {
   Material mat;
 } HitRecord;
 
-// outward_normal is of unit length
-void hit_record_set_face_normal(HitRecord *record, Ray *ray, vec3 outward_normal) {
-  record->is_front_face = vec3_dot_prod(ray->direction, outward_normal) < 0;
-  record->normal = record->is_front_face ? outward_normal : vec3_sign_flip(outward_normal);
+MovementPath make_movement_path(vec3 center, vec3 direction) {
+  MovementPath result = { center, direction };
+  return result;
 }
 
-typedef enum {
-  VIS_OBJECT_SPHERE
-} VisObject;
-
-typedef struct {
-  vec3 center;
-  vec3 direction;
-  f32 radius;
-  Material mat;
-} Sphere;
-
-Sphere make_sphere(vec3 center, f32 radius, Material mat) {
-  Sphere s = { center, Vec3(0.0f, 0.0f, 0.0f), radius, mat };
-  return s;
+vec3 movement_path_at(MovementPath *mp, f32 t) {
+  return line_at(mp->center, t, mp->direction);
 }
 
-Sphere make_moving_sphere(vec3 center, vec3 destination, f32 radius, Material mat) {
-  Sphere s = { center, destination, radius, mat };
-  return s;
-}
-
-
-typedef struct {
-  VisObject type;
-  union {
-    Sphere sphere;
-  };
-} Hittable;
-
-typedef struct {
-  Hittable *objects;
-  u64 count;
-} HittableList;
-
-b32 hit(Hittable *hittable, f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *record) {
-  switch (hittable->type) {
-    case VIS_OBJECT_SPHERE: {
-      vec3 current_sphere_position = 
-        line_at(hittable->sphere.center, ray->intersection_time, hittable->sphere.direction);
-      vec3 oc = vec3_sub(current_sphere_position, ray->origin);
-      float a = vec3_dot_prod(ray->direction, ray->direction);
-      float b = -2.0f * vec3_dot_prod(ray->direction, oc);
-      float c = vec3_dot_prod(oc, oc) - hittable->sphere.radius * hittable->sphere.radius;
-      float discriminant = b * b - 4*a*c;
-
-      if (discriminant < 0)
-        return 0;
-
-      f32 sqrt_discriminant = sqrtf(discriminant);
-      f32 root = (-b - sqrt_discriminant) / (2.0f*a);
-      if (ray_tmin >= root || root >= ray_tmax) {
-        root = (-b + sqrt_discriminant) / (2.0f*a);
-        if (ray_tmin >= root || root >= ray_tmax) {
-          return 0;
-        }
-      }
-
-      record->t = root;
-      record->point_hit = ray_at(ray, root);
-      record->mat = hittable->sphere.mat;
-      vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
-          vec3_sub(record->point_hit, current_sphere_position));
-      hit_record_set_face_normal(record, ray, outward_normal);
-
-      return 1;
-    } break;
-  }
-  return 0;
-}
-
-b32 hittable_list_hit(HittableList list, Ray *ray,
-    double ray_tmin, double ray_tmax, HitRecord *record) {
-  HitRecord temp_record;
-  b32 hit_anything = 0;
-  float closest_so_far = ray_tmax;
-
-  for (int i = 0; i < list.count; ++i) {
-    if (hit(&list.objects[i], ray_tmin, closest_so_far, ray, &temp_record)) {
-      hit_anything = 1;
-      closest_so_far = temp_record.t;
-      *record = temp_record;
-    }
-  }
-
-  return hit_anything;
+vec3 ray_at(Ray *ray, f32 t) {
+  return line_at(ray->origin, t, ray->direction);
 }
 
 vec3 refract(vec3 uv, vec3 n, f32 etai_over_etat) {
@@ -191,12 +146,6 @@ f32 reflectance(f32 cos, f32 refraction_index) {
   r0 = r0 * r0;
   return r0 + (1.0f - r0) * powf(1.0f - cos, 5.0f);
 }
-
-typedef struct {
-  b32 is_hit;
-  vec3 direction;
-  vec3 attenuation;
-} ScatterRes;
 
 ScatterRes material_scatter(Material *mat, vec3 r_in_direction, vec3 normal, b32 is_front_face) {
   ScatterRes result = {0};
@@ -234,12 +183,326 @@ ScatterRes material_scatter(Material *mat, vec3 r_in_direction, vec3 normal, b32
   return result;
 }
 
-vec3 ray_color(Ray *ray, i32 max_bounces, HittableList world) {
+Material make_lambertian(vec3 albedo) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  result.lambertian_albedo = albedo;
+  return result;
+}
+
+Material make_metal(vec3 albedo, f32 fuzz) {
+  Material result = {0};
+  result.type = MATERIAL_METAL;
+  result.metal.albedo = albedo;
+  result.metal.fuzz = fuzz;
+  return result;
+}
+
+Material make_dielectric(f32 refraction_index) {
+  Material result = {0};
+  result.type = MATERIAL_DIELECTRIC;
+  result.dielectric.refraction_index = refraction_index;
+  return result;
+}
+
+Aabb make_aabb(vec3 p1, vec3 p2) {
+  Aabb result = {0};
+  result.x0 = MIN(p1.x, p2.x);
+  result.x1 = MAX(p1.x, p2.x);
+  result.y0 = MIN(p1.y, p2.y);
+  result.y1 = MAX(p1.y, p2.y);
+  result.z0 = MIN(p1.z, p2.z);
+  result.z1 = MAX(p1.z, p2.z);
+  return result;
+}
+
+Aabb aabb_merge(Aabb *a, Aabb *b) {
+  Aabb result = {0};
+  result.x0 = MIN(a->x0, b->x0);
+  result.x1 = MAX(a->x1, b->x1);
+  result.y0 = MIN(a->y0, b->y0);
+  result.y1 = MAX(a->y1, b->y1);
+  result.z0 = MIN(a->z0, b->z0);
+  result.z1 = MAX(a->z1, b->z1);
+  return result;
+}
+
+Sphere make_sphere(vec3 center, f32 radius, Material mat) {
+  Sphere s = { make_movement_path(center, Vec3(0.0f, 0.0f, 0.0f)), radius, mat };
+  vec3 radius_vec = { radius, radius, radius };
+  s.bounding_box = make_aabb(vec3_sub(center, radius_vec), vec3_add(center, radius_vec));
+  return s;
+}
+
+Sphere make_moving_sphere(vec3 center, vec3 destination, f32 radius, Material mat) {
+  Sphere s = { make_movement_path(center, destination), radius, mat };
+  vec3 radius_vec = { radius, radius, radius };
+  vec3 min_pos = movement_path_at(&s.movement_path, 0.0f);
+  vec3 max_pos = movement_path_at(&s.movement_path, 1.0f);
+  Aabb bbox1 = make_aabb(vec3_sub(min_pos, radius_vec), vec3_add(min_pos, radius_vec));
+  Aabb bbox2 = make_aabb(vec3_sub(max_pos, radius_vec), vec3_add(max_pos, radius_vec));
+  s.bounding_box = aabb_merge(&bbox1, &bbox2);
+  return s;
+}
+
+Aabb *hittable_get_bounding_box(Hittable *hittable) {
+  Aabb *result = NULL;
+  switch (hittable->type) {
+    case VIS_OBJECT_SPHERE: {
+      result = &hittable->sphere.bounding_box;
+    } break;
+    case VIS_OBJECT_BVH_NODE: {
+      result = &hittable->bvh_node.bounding_box;
+    } break;
+    case VIS_OBJECT_HITTABLE_LIST: {
+      result = &hittable->hlist.bounding_box;
+    } break;
+  }
+  return result;
+}
+
+b32 hittable_list_comparison(Hittable *arr, u64 i, u64 j, HITTABLE_LIST_COMP_TYPE type) {
+  b32 comp = 0;
+  Aabb *bbox1 = hittable_get_bounding_box(&arr[i]);
+  Aabb *bbox2 = hittable_get_bounding_box(&arr[j]);
+  switch (type) {
+    case HITTABLE_LIST_COMP_TYPE_X_AXIS:
+      comp = bbox1->x0 < bbox2->x0;
+      break;
+    case HITTABLE_LIST_COMP_TYPE_Y_AXIS:
+      comp = bbox1->y0 < bbox2->y0;
+      break;
+    case HITTABLE_LIST_COMP_TYPE_Z_AXIS:
+      comp = bbox1->z0 < bbox2->z0;
+      break;
+  }
+  return comp;
+}
+
+void hittable_list_merge(Hittable *arr, Hittable *tmp, u64 start, u64 mid, u64 end,
+    HITTABLE_LIST_COMP_TYPE type) {
+  u64 start_max = mid - 1;
+  u64 tmp_pos = start;
+  u64 count = end - start + 1;
+
+  while ((end <= start_max) && (mid <= end)) {
+    if (hittable_list_comparison(arr, start, mid, type)) {
+      tmp[tmp_pos] = arr[start];
+      tmp_pos = tmp_pos + 1;
+      start = start + 1;
+    } else {
+      tmp[tmp_pos] = arr[mid];
+      tmp_pos = tmp_pos + 1;
+      mid = mid + 1;
+    }
+  }
+
+  while (start <= start_max) {
+    tmp[tmp_pos] = arr[start];
+    start = start + 1;
+    tmp_pos = tmp_pos + 1;
+  }
+
+  while (mid <= end) {
+    tmp[tmp_pos] = arr[mid];
+    mid = mid + 1;
+    tmp_pos = tmp_pos + 1;
+  }
+
+  for (u64 i = 0; i < count; ++i) {
+    arr[end] = tmp[end];
+    end = end - 1;
+  }
+}
+
+void hittable_list_split_merge(Hittable *arr, Hittable *tmp, u64 start, u64 end,
+    HITTABLE_LIST_COMP_TYPE type) {
+  if (end > start) {
+    u64 mid = (end + start) / 2;
+    hittable_list_split_merge(arr, tmp, start, mid, type);
+    hittable_list_split_merge(arr, tmp, mid + 1, end, type);
+    hittable_list_merge(arr, tmp, start, mid + 1, end, type);
+  }
+}
+
+Hittable hittables_copy[WORLD_SIZE] = {0};
+
+void hittable_list_sort_bound(HittableList *list, u64 start, u64 end, 
+    HITTABLE_LIST_COMP_TYPE type) {
+  memcpy(hittables_copy, list->objects, WORLD_SIZE);
+  hittable_list_split_merge(list->objects, hittables_copy, start, end, type);
+}
+
+typedef struct {
+  u8 *data;
+  u64 current_pos;
+  u64 size;
+} MemArena;
+
+void mem_arena_alloc(MemArena *arena, u64 size) {
+  arena->size = size;
+  arena->data = malloc(size);
+  arena->current_pos = 0;
+}
+
+void *mem_arena_push(MemArena *arena, u64 size) {
+  u8 *result = NULL;
+  if (arena->current_pos + size < arena->size) {
+    result = arena->data + arena->current_pos;
+    arena->current_pos += size;
+  }
+  return (void *)result;
+}
+
+Hittable *make_bvh_node_from_hittable_list_bound(MemArena *arena, HittableList *list,
+    u64 start, u64 end) {
+  Hittable *result = mem_arena_push(arena, sizeof(Hittable));
+  result->type = VIS_OBJECT_BVH_NODE;
+  u64 span = end - start;
+  BvhNode *node = &result->bvh_node;
+
+  if (span == 1) {
+    node->left = node->right = mem_arena_push(arena, sizeof(Hittable));
+    memcpy(node->left, &list->objects[start], sizeof(Hittable));
+  } else if (span == 2) {
+    node->left = mem_arena_push(arena, sizeof(Hittable));
+    node->right = mem_arena_push(arena, sizeof(Hittable));
+    memcpy(node->left, &list->objects[start], sizeof(Hittable));
+    memcpy(node->right, &list->objects[start + 1], sizeof(Hittable));
+  } else {
+    HITTABLE_LIST_COMP_TYPE comp_type = random_i32_bound(0, 2);
+    hittable_list_sort_bound(list, start, end, comp_type);
+#if 0
+    for (u64 i = start; i < end - 1; ++i) {
+      b32 comp = 0;
+      Aabb *debug_bbox1 = hittable_get_bounding_box(&list->objects[i]);
+      Aabb *debug_bbox2 = hittable_get_bounding_box(&list->objects[i + 1]);
+      switch (comp_type) {
+        case HITTABLE_LIST_COMP_TYPE_X_AXIS:
+          comp = debug_bbox1->x0 <= debug_bbox2->x0;
+        break;
+        case HITTABLE_LIST_COMP_TYPE_Y_AXIS:
+          comp = debug_bbox1->y0 <= debug_bbox2->y0;
+        break;
+        case HITTABLE_LIST_COMP_TYPE_Z_AXIS:
+          comp = debug_bbox1->z0 <= debug_bbox2->z0;
+        break;
+      }
+      if (!comp) {
+        *((int *)0) = 0;
+      }
+    }
+#endif
+    u64 mid = start + span / 2;
+    node->left = make_bvh_node_from_hittable_list_bound(arena, list, start, mid);
+    node->right = make_bvh_node_from_hittable_list_bound(arena, list, mid, end);
+  }
+
+  Aabb *left_bbox = hittable_get_bounding_box(node->left);
+  Aabb *right_bbox = hittable_get_bounding_box(node->right);
+  node->bounding_box = aabb_merge(left_bbox, right_bbox);
+  return result;
+}
+
+Hittable *make_bvh_node_from_hittable_list(MemArena *arena, HittableList *list) {
+  mem_arena_alloc(arena, WORLD_SIZE * sizeof(Hittable) * 2);
+  return make_bvh_node_from_hittable_list_bound(arena, list, 0, list->count);
+}
+
+void hittable_list_add(HittableList *list, Hittable *hittable) {
+  if (list->count < list->size) {
+    list->objects[list->count++] = *hittable;
+    Aabb *other_bbox = hittable_get_bounding_box(hittable);
+    list->bounding_box = aabb_merge(&list->bounding_box, other_bbox);
+  }
+}
+
+// outward_normal is of unit length
+void hit_record_set_face_normal(HitRecord *record, Ray *ray, vec3 outward_normal) {
+  record->is_front_face = vec3_dot_prod(ray->direction, outward_normal) < 0;
+  record->normal = record->is_front_face ? outward_normal : vec3_sign_flip(outward_normal);
+}
+
+b32 aabb_hit(Aabb *bbox, Ray *ray, f32 ray_t0, f32 ray_t1) {
+  f32 t0_x = (bbox->x0 - ray->origin.x) / ray->direction.x;
+  f32 t1_x = (bbox->x1 - ray->origin.x) / ray->direction.x;
+
+  interval_sort(&t0_x, &t1_x);
+  if (!interval_overlap(t0_x, t1_x, ray_t0, ray_t1))
+    return 0;
+
+  f32 t0_y = (bbox->y0 - ray->origin.y) / ray->direction.y;
+  f32 t1_y = (bbox->y1 - ray->origin.y) / ray->direction.y;
+
+  interval_sort(&t0_y, &t1_y);
+  if (!interval_overlap(t0_x, t1_x, t0_y, t1_y))
+    return 0;
+
+  f32 t0_z = (bbox->z0 - ray->origin.z) / ray->direction.z;
+  f32 t1_z = (bbox->z1 - ray->origin.z) / ray->direction.z;
+
+  interval_sort(&t0_z, &t1_z);
+  return interval_overlap(t0_y, t1_y, t0_z, t1_z);
+}
+
+b32 hittable_list_hit(HittableList *list, Ray *ray,
+    double ray_tmin, double ray_tmax, HitRecord *record);
+
+b32 hit(Hittable *hittable, f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *record) {
+  switch (hittable->type) {
+    case VIS_OBJECT_SPHERE: {
+      vec3 current_sphere_position = 
+        movement_path_at(&hittable->sphere.movement_path, ray->intersection_time);
+      vec3 oc = vec3_sub(current_sphere_position, ray->origin);
+      float a = vec3_dot_prod(ray->direction, ray->direction);
+      float b = -2.0f * vec3_dot_prod(ray->direction, oc);
+      float c = vec3_dot_prod(oc, oc) - hittable->sphere.radius * hittable->sphere.radius;
+      float discriminant = b * b - 4*a*c;
+
+      if (discriminant < 0)
+        return 0;
+
+      f32 sqrt_discriminant = sqrtf(discriminant);
+      f32 root = (-b - sqrt_discriminant) / (2.0f*a);
+      if (ray_tmin >= root || root >= ray_tmax) {
+        root = (-b + sqrt_discriminant) / (2.0f*a);
+        if (ray_tmin >= root || root >= ray_tmax) {
+          return 0;
+        }
+      }
+
+      record->t = root;
+      record->point_hit = ray_at(ray, root);
+      record->mat = hittable->sphere.mat;
+      vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
+          vec3_sub(record->point_hit, current_sphere_position));
+      hit_record_set_face_normal(record, ray, outward_normal);
+
+      return 1;
+    } break;
+    case VIS_OBJECT_BVH_NODE: {
+      if (aabb_hit(&hittable->bvh_node.bounding_box, ray, ray_tmin, ray_tmax)) {
+        b32 hit_left = hit(hittable->bvh_node.left, ray_tmin, ray_tmax, ray, record);
+        b32 hit_right =
+          hit(hittable->bvh_node.right, ray_tmin, hit_left ? record->t : ray_tmax, ray, record);
+        return hit_left || hit_right;
+      } else {
+        return 0;
+      }
+    } break;
+    case VIS_OBJECT_HITTABLE_LIST: {
+      return hittable_list_hit(&hittable->hlist, ray, ray_tmin, ray_tmax, record);
+    } break;
+  }
+  return 0;
+}
+
+vec3 ray_color(Ray *ray, i32 max_bounces, Hittable *world) {
   if (max_bounces <= 0)
     return Color(0, 0, 0);
 
   HitRecord record = {0};
-  if (hittable_list_hit(world, ray, 0.001f, INFINITY, &record)) {
+  if (hit(world, 0.001f, INFINITY, ray, &record)) {
     ScatterRes scatter = material_scatter(&record.mat, ray->direction, record.normal,
         record.is_front_face);
     if (scatter.is_hit) {
@@ -258,6 +521,23 @@ vec3 ray_color(Ray *ray, i32 max_bounces, HittableList world) {
   f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
   return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
       vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
+}
+
+b32 hittable_list_hit(HittableList *list, Ray *ray,
+    double ray_tmin, double ray_tmax, HitRecord *record) {
+  HitRecord temp_record;
+  b32 hit_anything = 0;
+  float closest_so_far = ray_tmax;
+
+  for (int i = 0; i < list->count; ++i) {
+    if (hit(&list->objects[i], ray_tmin, closest_so_far, ray, &temp_record)) {
+      hit_anything = 1;
+      closest_so_far = temp_record.t;
+      *record = temp_record;
+    }
+  }
+
+  return hit_anything;
 }
 
 f32 linear_to_gamma(f32 linear_component) {
@@ -452,19 +732,33 @@ vec3 defocus_disk_sample(vec3 center, vec3 defocus_disk_u, vec3 defocus_disk_v) 
       center, vec3_add(vec3_scale(p.x, defocus_disk_u), vec3_scale(p.y, defocus_disk_v)));
 }
 
+void print_bvh_info(Hittable *node) {
+  Aabb *bbox = hittable_get_bounding_box(node);
+  switch (node->type) {
+    case VIS_OBJECT_SPHERE: {
+      printf("%f-%f,%f-%f,%f-%f sphere\n", bbox->x0, bbox->x1, bbox->y0, bbox->y1, bbox->z0, bbox->z1);
+    } break;
+    case VIS_OBJECT_BVH_NODE: {
+      printf("%f-%f,%f-%f,%f-%f bvh_node\n", bbox->x0, bbox->x1, bbox->y0, bbox->y1, bbox->z0, bbox->z1);
+      print_bvh_info(node->bvh_node.left);
+      print_bvh_info(node->bvh_node.right);
+    } break;
+  }
+}
+
 i32 main() {
   vec3_to_unit_vec_test();
 
   HittableList world = {0};
   Material default_mat = make_lambertian(Vec3(0.5f, 0.5f, 0.5f));
-  Hittable hittables[500];
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
 
   world.objects = hittables;
-  world.count = 0;
+  world.size = WORLD_SIZE;
 
   Material material_ground = make_lambertian(Color(0.5f, 0.5f, 0.5f));
   Hittable ground = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, -1000.0f, 0.0f), 1000.0f, material_ground) };
-  hittables[world.count++] = ground;
+  hittable_list_add(&world, &ground);
 
   for (i32 a = -11; a < 11; ++a) {
     for (i32 b = -11; b < 11; ++b) {
@@ -479,7 +773,7 @@ i32 main() {
           vec3 sphere_direction = Vec3(0.0f, random_f32_bound(0.0f, 0.5f), 0.0f);
           Hittable obj = { VIS_OBJECT_SPHERE, 
             make_moving_sphere(center, sphere_direction, 0.2f, current_material) };
-          hittables[world.count++] = obj;
+          hittable_list_add(&world, &obj);
         } else {
           if (material_choice < 0.95f) {
             vec3 albedo = vec3_random_bound(0.5f, 1.0f);
@@ -489,7 +783,7 @@ i32 main() {
             current_material = make_dielectric(1.5f);
           }
           Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
-          hittables[world.count++] = obj;
+          hittable_list_add(&world, &obj);
         }
       }
     }
@@ -497,15 +791,25 @@ i32 main() {
 
   Material mat1 = make_dielectric(1.5f);
   Hittable big_sphere1 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, 1.0f, 0.0f), 1.0f, mat1) };
-  hittables[world.count++] = big_sphere1;
+  hittable_list_add(&world, &big_sphere1);
 
   Material mat2 = make_lambertian(Vec3(0.4f, 0.2f, 0.1f));
   Hittable big_sphere2 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(-4.0f, 1.0f, 0.0f), 1.0f, mat2) };
-  hittables[world.count++] = big_sphere2;
+  hittable_list_add(&world, &big_sphere2);
 
   Material mat3 = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.0f);
   Hittable big_sphere3 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(4.0f, 1.0f, 0.0f), 1.0f, mat3) };
-  hittables[world.count++] = big_sphere3;
+  hittable_list_add(&world, &big_sphere3);
+
+  MemArena nodes_arena = {0};
+  Hittable *optimized_world = make_bvh_node_from_hittable_list(&nodes_arena, &world);
+  /*
+  Hittable hworld = {0};
+  hworld.type = VIS_OBJECT_HITTABLE_LIST;
+  hworld.hlist = world;
+  Hittable *optimized_world = &hworld;
+  */
+  print_bvh_info(optimized_world);
 
   i32 samples_per_pixel = 10;
   f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
@@ -577,7 +881,7 @@ i32 main() {
         sampling_ray.intersection_time = random_f32();
 
         vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(&sampling_ray, max_bounces, world));
+            ray_color(&sampling_ray, max_bounces, optimized_world));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
 		}

@@ -9,6 +9,10 @@ f32 random_f32_bound(f32 min, f32 max) {
   return min + (max-min)*random_f32();
 }
 
+i32 random_i32_bound(i32 min, i32 max) {
+  return (int)(random_f32_bound(min, max + 1));
+}
+
 f32 clampf(f32 val, f32 min, f32 max) {
   if (val < min)
     return min;
@@ -49,7 +53,11 @@ void interval_sort(f32 *x0, f32 *x1) {
   if (*x0 > *x1) {
     f32 temp = *x0;
     *x0 = *x1;
-    *x1 = *x0;
+    *x1 = temp;
   }
+}
+
+vec3 line_at(vec3 origin, f32 t, vec3 direction) {
+  return vec3_add(origin, vec3_scale(t, direction));
 }
 
