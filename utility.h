@@ -18,6 +18,8 @@ typedef int32_t b32; // boolean
 typedef float f32;
 typedef double f64;
 
+#define CLAMP(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
+
 f32 random_f32();
 f32 random_f32_bound(f32 min, f32 max);
 f32 random_f32_bound(f32 min, f32 max);

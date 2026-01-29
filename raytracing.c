@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "include/stb_image.h"
 
 #include "vec3.h"
 #include "utility.h"
@@ -14,6 +16,61 @@
 #define WORLD_SIZE 500
 
 const float pi = 3.1415926535897932385f;
+
+typedef struct {
+  u8 *data;
+  u64 current_pos;
+  u64 size;
+} MemArena;
+
+void mem_arena_alloc(MemArena *arena, u64 size) {
+  arena->size = size;
+  arena->data = malloc(size);
+  arena->current_pos = 0;
+}
+
+void *mem_arena_push(MemArena *arena, u64 size) {
+  u8 *result = NULL;
+  if (arena->current_pos + size < arena->size) {
+    result = arena->data + arena->current_pos;
+    arena->current_pos += size;
+  }
+  return (void *)result;
+}
+
+typedef struct {
+  vec3 albedo;
+} SolidColor;
+
+typedef struct Texture Texture;
+
+typedef struct {
+  f32 inverted_scale;
+  Texture *even;
+  Texture *odd;
+} Checker;
+
+typedef struct {
+  vec3 *pixels;
+  i32 width;
+  i32 height;
+} ImageTexture;
+
+typedef u32 TEXTURE;
+enum {
+  TEXTURE_SOLID_COLOR,
+  TEXTURE_CHECKER,
+  TEXTURE_IMAGE
+};
+
+struct Texture {
+  TEXTURE type;
+  union {
+    SolidColor solid_color;
+    Checker checker;
+    ImageTexture image_texture;
+  };
+};
 
 typedef struct {
   f32 x0, x1;
@@ -34,15 +91,15 @@ typedef struct {
 
 typedef u32 MaterialType;
 enum {
-  MATERIAL_METAL,
   MATERIAL_LAMBERTIAN,
+  MATERIAL_METAL,
   MATERIAL_DIELECTRIC
 };
 
 typedef struct Material {
   MaterialType type;
   union {
-    vec3 lambertian_albedo;
+    Texture *lambertian_texture;
     struct {
       vec3 albedo;
       f32 fuzz;
@@ -111,7 +168,77 @@ typedef struct {
   float t;
   b32 is_front_face;
   Material mat;
+  f32 u;
+  f32 v;
 } HitRecord;
+
+SolidColor make_solid_color(vec3 albedo) {
+  SolidColor result = { albedo };
+  return result;
+}
+
+Texture make_checker_texture(f32 scale, Texture *even, Texture *odd) {
+  Texture result = {0};
+  result.type = TEXTURE_CHECKER;
+  result.checker.inverted_scale = 1.0f / scale;
+  result.checker.even = even;
+  result.checker.odd = odd;
+  return result;
+}
+
+Texture make_image_texture(char *file_name) {
+  ImageTexture img_tex = {0};
+  i32 bytes_per_pixel = 3;
+  i32 dummy = 0;
+  f32 *data = stbi_loadf(file_name, &img_tex.width, &img_tex.height, &dummy, bytes_per_pixel);
+  img_tex.pixels = (vec3 *)data;
+  Texture result = { TEXTURE_IMAGE };
+  result.image_texture = img_tex;
+  return result;
+}
+
+vec3 image_texture_get_pixel(ImageTexture *img_tex, i32 x, i32 y) {
+  vec3 result = {0};
+  if (img_tex->pixels == NULL) {
+    result = Vec3(1, 0, 1);
+  } else {
+    x = CLAMP(x, 0, img_tex->width);
+    y = CLAMP(y, 0, img_tex->height);
+    result = *(img_tex->pixels + y * img_tex->width + x);
+  }
+  return result;
+}
+
+vec3 texture_get_color(Texture *texture, f32 u, f32 v, vec3 point) {
+  vec3 result = {0};
+  switch(texture->type) {
+    case TEXTURE_SOLID_COLOR: {
+      result = texture->solid_color.albedo;
+    } break;
+    case TEXTURE_CHECKER: {
+      Checker *checker = &texture->checker;
+      u32 x = (u32)floorf(checker->inverted_scale * point.x);
+      u32 y = (u32)floorf(checker->inverted_scale * point.y);
+      u32 z = (u32)floorf(checker->inverted_scale * point.z);
+      
+      b32 is_even = (x + y + z) % 2 == 0;
+
+      result = is_even ?
+        texture_get_color(checker->even, u, v, point) :
+        texture_get_color(checker->odd, u, v, point);
+    } break;
+    case TEXTURE_IMAGE: {
+      ImageTexture *img_tex = &texture->image_texture;
+      if (img_tex->height <= 0)
+        result = Vec3(0, 1, 1);
+      u = CLAMP(u, 0, 1);
+      v = 1.0f - CLAMP(v, 0, 1);
+      result =
+        image_texture_get_pixel(img_tex, (i32)(u * img_tex->width), (i32)(v * img_tex->height));
+    } break;
+  }
+  return result;
+}
 
 MovementPath make_movement_path(vec3 center, vec3 direction) {
   MovementPath result = { center, direction };
@@ -147,46 +274,57 @@ f32 reflectance(f32 cos, f32 refraction_index) {
   return r0 + (1.0f - r0) * powf(1.0f - cos, 5.0f);
 }
 
-ScatterRes material_scatter(Material *mat, vec3 r_in_direction, vec3 normal, b32 is_front_face) {
+ScatterRes material_scatter(Material *mat, vec3 r_in_direction, HitRecord *record) {
   ScatterRes result = {0};
   switch (mat->type) {
     case MATERIAL_LAMBERTIAN: {
       result.is_hit = 1;
-      result.direction = vec3_add(normal, vec3_random_unit_vector());
+      result.direction = vec3_add(record->normal, vec3_random_unit_vector());
       if (vec3_is_near_zero(result.direction))
-        result.direction = normal;
-      result.attenuation = mat->lambertian_albedo;
+        result.direction = record->normal;
+      result.attenuation = texture_get_color(mat->lambertian_texture, 
+          record->u, record->v, record->point_hit);
     } break;
     case MATERIAL_METAL: {
-      vec3 reflected = reflect(r_in_direction, normal);
+      vec3 reflected = reflect(r_in_direction, record->normal);
       result.direction = vec3_add(vec3_to_unit_vec(reflected),
           vec3_scale(mat->metal.fuzz, vec3_random_unit_vector()));
       result.attenuation = mat->metal.albedo;
-      result.is_hit = vec3_dot_prod(result.direction, normal) > 0;
+      result.is_hit = vec3_dot_prod(result.direction, record->normal) > 0;
     } break;
     case MATERIAL_DIELECTRIC: {
       result.attenuation = Color(1.0f, 1.0f, 1.0f);
       f32 ri =
-        is_front_face ? (1.0f / mat->dielectric.refraction_index) : mat->dielectric.refraction_index;
+        record->is_front_face ? (1.0f / mat->dielectric.refraction_index) : mat->dielectric.refraction_index;
       vec3 unit_direction = vec3_to_unit_vec(r_in_direction);
-      f32 cos_theta = fmin(vec3_dot_prod(vec3_sign_flip(unit_direction), normal), 1.0f);
+      f32 cos_theta = fmin(vec3_dot_prod(vec3_sign_flip(unit_direction), record->normal), 1.0f);
       f32 sin_theta = sqrtf(1.0f - cos_theta * cos_theta);
 
       b32 is_unable_to_refract = ri * sin_theta > 1.0f;
       if (is_unable_to_refract || reflectance(cos_theta, ri) > random_f32())
-        result.direction = reflect(unit_direction, normal);
+        result.direction = reflect(unit_direction, record->normal);
       else
-        result.direction = refract(unit_direction, normal, ri);
+        result.direction = refract(unit_direction, record->normal, ri);
       result.is_hit = 1;
     } break;
   }
   return result;
 }
 
-Material make_lambertian(vec3 albedo) {
+Material make_lambertian_solid_color(MemArena *arena, vec3 albedo) {
   Material result = {0};
   result.type = MATERIAL_LAMBERTIAN;
-  result.lambertian_albedo = albedo;
+  SolidColor sc = { albedo };
+  result.lambertian_texture = mem_arena_push(arena, sizeof(Texture));
+  result.lambertian_texture->type = TEXTURE_SOLID_COLOR;
+  result.lambertian_texture->solid_color = sc;
+  return result;
+}
+
+Material make_lambertian(Texture *tex) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  result.lambertian_texture = tex;
   return result;
 }
 
@@ -227,11 +365,24 @@ Aabb aabb_merge(Aabb *a, Aabb *b) {
   return result;
 }
 
+void sphere_get_uv(vec3 *point, f32 *u, f32 *v) {
+  f32 theta = acos(-point->y);
+  f32 phi = atan2(-point->z, point->x) + pi;
+
+  *u = phi / (2 * pi);
+  *v = theta / pi;
+}
+
 Sphere make_sphere(vec3 center, f32 radius, Material mat) {
   Sphere s = { make_movement_path(center, Vec3(0.0f, 0.0f, 0.0f)), radius, mat };
   vec3 radius_vec = { radius, radius, radius };
   s.bounding_box = make_aabb(vec3_sub(center, radius_vec), vec3_add(center, radius_vec));
   return s;
+}
+
+Hittable make_hittable_sphere(vec3 center, f32 radius, Material mat) {
+  Hittable result = { VIS_OBJECT_SPHERE, make_sphere(center, radius, mat) };
+  return result;
 }
 
 Sphere make_moving_sphere(vec3 center, vec3 destination, f32 radius, Material mat) {
@@ -331,27 +482,6 @@ void hittable_list_sort_bound(HittableList *list, u64 start, u64 end,
     HITTABLE_LIST_COMP_TYPE type) {
   memcpy(hittables_copy, list->objects, WORLD_SIZE);
   hittable_list_split_merge(list->objects, hittables_copy, start, end, type);
-}
-
-typedef struct {
-  u8 *data;
-  u64 current_pos;
-  u64 size;
-} MemArena;
-
-void mem_arena_alloc(MemArena *arena, u64 size) {
-  arena->size = size;
-  arena->data = malloc(size);
-  arena->current_pos = 0;
-}
-
-void *mem_arena_push(MemArena *arena, u64 size) {
-  u8 *result = NULL;
-  if (arena->current_pos + size < arena->size) {
-    result = arena->data + arena->current_pos;
-    arena->current_pos += size;
-  }
-  return (void *)result;
 }
 
 Hittable *make_bvh_node_from_hittable_list_bound(MemArena *arena, HittableList *list,
@@ -476,6 +606,7 @@ b32 hit(Hittable *hittable, f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *rec
       record->mat = hittable->sphere.mat;
       vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
           vec3_sub(record->point_hit, current_sphere_position));
+      sphere_get_uv(&outward_normal, &record->u, &record->v);
       hit_record_set_face_normal(record, ray, outward_normal);
 
       return 1;
@@ -503,8 +634,7 @@ vec3 ray_color(Ray *ray, i32 max_bounces, Hittable *world) {
 
   HitRecord record = {0};
   if (hit(world, 0.001f, INFINITY, ray, &record)) {
-    ScatterRes scatter = material_scatter(&record.mat, ray->direction, record.normal,
-        record.is_front_face);
+    ScatterRes scatter = material_scatter(&record.mat, ray->direction, &record);
     if (scatter.is_hit) {
       Ray bounce = {0};
       bounce.origin = record.point_hit;
@@ -746,17 +876,128 @@ void print_bvh_info(Hittable *node) {
   }
 }
 
-i32 main() {
-  vec3_to_unit_vec_test();
+typedef struct {
+  f32 img_ratio;
+  i32 img_width;
+  i32 samples_per_pixel;
+  i32 max_bounces;
+  f32 vfov;
+  vec3 lookfrom;
+  vec3 lookat;
+  vec3 view_up;
+  f32 defocus_angle;
+} RenderSettings;
 
-  HittableList world = {0};
-  Material default_mat = make_lambertian(Vec3(0.5f, 0.5f, 0.5f));
+static RenderSettings g_default_render_settings = 
+  { 16.0f/9.0f, 1200, 10, 50, 20.0f, { 13.0f, 2.0f, 3.0f },
+    { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f };
+
+void render_w_settings(HittableList *world, RenderSettings *settings) {
+  MemArena nodes_arena = {0};
+  Hittable *optimized_world = make_bvh_node_from_hittable_list(&nodes_arena, world);
+  /*
+  Hittable hworld = {0};
+  hworld.type = VIS_OBJECT_HITTABLE_LIST;
+  hworld.hlist = world;
+  Hittable *optimized_world = &hworld;
+  print_bvh_info(optimized_world);
+  */
+
+  f32 pixel_samples_scale = 1.0f / (f32)settings->samples_per_pixel;
+
+	i32 img_width = settings->img_width;
+	i32 img_height = (int)(img_width / settings->img_ratio);
+	
+	/* f32 camera_viewport_dist = vec3_length(vec3_sub(settings->lookfrom, settings->lookat)); */
+  f32 focus_dist = 10.0f;
+  f32 theta = settings->vfov * (pi / 180.0f);
+  f32 h = tanf(theta / 2.0f);
+	f32 viewport_height = 2.0f * h * focus_dist;
+	f32 viewport_ratio = (f32)img_width /  (f32)img_height;
+	f32 viewport_width = viewport_height * viewport_ratio;
+	vec3 camera_pos = settings->lookfrom;
+
+  vec3 cam_w = vec3_to_unit_vec(vec3_sub(settings->lookfrom, settings->lookat));
+  vec3 cam_u = vec3_to_unit_vec(vec3_cross_product(settings->view_up, cam_w));
+  vec3 cam_v = vec3_cross_product(cam_w, cam_u);
+	
+  vec3 viewport_v = vec3_scale(viewport_height, vec3_sign_flip(cam_v));
+  vec3 viewport_u = vec3_scale(viewport_width, cam_u);
+
+  vec3 pixel_delta_v = vec3_scale(1.0f/(f32)img_height, viewport_v);
+  vec3 pixel_delta_u = vec3_scale(1.0f/(f32)img_width, viewport_u);
+	
+	vec3 viewport_left_upper_corner = camera_pos;
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(focus_dist, cam_w));
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_u));
+  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_v));
+
+  f32 defocus_radius = focus_dist * tan((settings->defocus_angle / 2.0f) * pi / 180.0f);
+  vec3 defocus_disk_u = vec3_scale(defocus_radius, cam_u);
+  vec3 defocus_disk_v = vec3_scale(defocus_radius, cam_v);
+
+	vec3 current_pixel_center = viewport_left_upper_corner;
+  vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_v));
+  vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_u));
+	
+  vec3 *pixels_colors = calloc(img_height * img_width, sizeof(vec3));
+
+  f64 time_start = timer_start_ms();
+  f64 time_start_s = timer_start();
+	for (i32 i = 0; i < img_height; ++i) {
+		for (i32 j = 0; j < img_width; ++j) {
+      u64 curr_idx = i * img_width + j;
+      vec3 current_ray_direction = 
+          vec3_add(
+            current_pixel_center, vec3_add(
+              vec3_scale((f32)i, pixel_delta_v),
+              vec3_scale((f32)j, pixel_delta_u)));
+      for (i32 sample_num = 0; sample_num < settings->samples_per_pixel; ++sample_num) {
+        Ray sampling_ray = {0};
+        sampling_ray.origin = (settings->defocus_angle <= 0) ?
+          camera_pos : defocus_disk_sample(camera_pos, defocus_disk_u, defocus_disk_v);
+        f32 x_offset = random_f32() - 0.5f;
+        f32 y_offset = random_f32() - 0.5f;
+        sampling_ray.direction = vec3_sub(current_ray_direction, sampling_ray.origin);
+        vec3_inplace_add(&sampling_ray.direction, vec3_scale(x_offset, pixel_delta_u));
+        vec3_inplace_add(&sampling_ray.direction, vec3_scale(y_offset, pixel_delta_v));
+        sampling_ray.intersection_time = random_f32();
+
+        vec3_inplace_add(&pixels_colors[curr_idx],
+            ray_color(&sampling_ray, settings->max_bounces, optimized_world));
+      }
+      vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
+		}
+	}
+  f64 time_elapsed = timer_stop_ms(time_start);
+  printf("Rendering time: %fms\n", time_elapsed);
+  f64 time_elapsed_s = timer_stop(time_start_s);
+  printf("Rendering time: %fs\n", time_elapsed_s);
+
+  pixels_to_ppm(pixels_colors, img_width, img_height);
+}
+
+void render(HittableList *world) {
+  render_w_settings(world, &g_default_render_settings);
+}
+
+void bouncing_spheres_scene() {
+  MemArena texture_arena = {0};
+  mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
+
   Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
 
+  HittableList world = {0};
   world.objects = hittables;
   world.size = WORLD_SIZE;
 
-  Material material_ground = make_lambertian(Color(0.5f, 0.5f, 0.5f));
+  Material default_mat = make_lambertian_solid_color(&texture_arena, Vec3(0.5f, 0.5f, 0.5f));
+
+  Texture color_even = { TEXTURE_SOLID_COLOR, make_solid_color(Color(0.2f, 0.3f, 0.1f)) };
+  Texture color_odd = { TEXTURE_SOLID_COLOR, make_solid_color(Color(0.9f, 0.9f, 0.9f)) };
+  Texture checker_texture = make_checker_texture(0.32f, &color_even, &color_odd);
+
+  Material material_ground = make_lambertian(&checker_texture);
   Hittable ground = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, -1000.0f, 0.0f), 1000.0f, material_ground) };
   hittable_list_add(&world, &ground);
 
@@ -769,7 +1010,7 @@ i32 main() {
         Material current_material;
         if (material_choice < 0.8f) {
           vec3 albedo = vec3_comp_scale(vec3_random(), vec3_random());
-          current_material = make_lambertian(albedo);
+          current_material = make_lambertian_solid_color(&texture_arena, albedo);
           vec3 sphere_direction = Vec3(0.0f, random_f32_bound(0.0f, 0.5f), 0.0f);
           Hittable obj = { VIS_OBJECT_SPHERE, 
             make_moving_sphere(center, sphere_direction, 0.2f, current_material) };
@@ -793,7 +1034,7 @@ i32 main() {
   Hittable big_sphere1 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, 1.0f, 0.0f), 1.0f, mat1) };
   hittable_list_add(&world, &big_sphere1);
 
-  Material mat2 = make_lambertian(Vec3(0.4f, 0.2f, 0.1f));
+  Material mat2 = make_lambertian_solid_color(&texture_arena, Vec3(0.4f, 0.2f, 0.1f));
   Hittable big_sphere2 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(-4.0f, 1.0f, 0.0f), 1.0f, mat2) };
   hittable_list_add(&world, &big_sphere2);
 
@@ -801,95 +1042,67 @@ i32 main() {
   Hittable big_sphere3 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(4.0f, 1.0f, 0.0f), 1.0f, mat3) };
   hittable_list_add(&world, &big_sphere3);
 
-  MemArena nodes_arena = {0};
-  Hittable *optimized_world = make_bvh_node_from_hittable_list(&nodes_arena, &world);
-  /*
-  Hittable hworld = {0};
-  hworld.type = VIS_OBJECT_HITTABLE_LIST;
-  hworld.hlist = world;
-  Hittable *optimized_world = &hworld;
-  */
-  print_bvh_info(optimized_world);
+  render(&world);
+}
 
-  i32 samples_per_pixel = 10;
-  f32 pixel_samples_scale = 1.0f / (f32)samples_per_pixel;
-  i32 max_bounces = 50;
+void checkered_spheres_scene() {
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
 
-  f32 vfov = 20.0f;
-  vec3 lookfrom = Vec3(13.0f, 2.0f, 3.0f);
-  vec3 lookat = Vec3(0.0f, 0.0f, 0.0f);
-  vec3 view_up = Vec3(0.0f, 1.0f, 0.0f);
+  HittableList world = {0};
+  world.objects = hittables;
+  world.size = WORLD_SIZE;
 
-	i32 img_width = 1200;
-	f32 img_ratio = 16.0f/9.0f;
-	i32 img_height = (int)(img_width / img_ratio);
-	
-	/* f32 camera_viewport_dist = vec3_length(vec3_sub(lookfrom, lookat)); */
-  f32 defocus_angle = 0.6f;
-  f32 focus_dist = 10.0f;
-  f32 theta = vfov * (pi / 180.0f);
-  f32 h = tanf(theta / 2.0f);
-	f32 viewport_height = 2.0f * h * focus_dist;
-	f32 viewport_ratio = (f32)img_width /  (f32)img_height;
-	f32 viewport_width = viewport_height * viewport_ratio;
-	vec3 camera_pos = lookfrom;
+  Texture color_even = { TEXTURE_SOLID_COLOR, make_solid_color(Color(0.2f, 0.3f, 0.1f)) };
+  Texture color_odd = { TEXTURE_SOLID_COLOR, make_solid_color(Color(0.9f, 0.9f, 0.9f)) };
+  Texture checker_texture = make_checker_texture(0.32f, &color_even, &color_odd);
 
-  vec3 cam_w = vec3_to_unit_vec(vec3_sub(lookfrom, lookat));
-  vec3 cam_u = vec3_to_unit_vec(vec3_cross_product(view_up, cam_w));
-  vec3 cam_v = vec3_cross_product(cam_w, cam_u);
-	
-  vec3 viewport_v = vec3_scale(viewport_height, vec3_sign_flip(cam_v));
-  vec3 viewport_u = vec3_scale(viewport_width, cam_u);
+  Hittable sphere1 = make_hittable_sphere(Vec3(0.0f, -10.0f, 0.0f), 10.0f, make_lambertian(&checker_texture));
+  Hittable sphere2 = make_hittable_sphere(Vec3(0.0f, 10.0f, 0.0f), 10.0f, make_lambertian(&checker_texture));
 
-  vec3 pixel_delta_v = vec3_scale(1.0f/(f32)img_height, viewport_v);
-  vec3 pixel_delta_u = vec3_scale(1.0f/(f32)img_width, viewport_u);
-	
-	vec3 viewport_left_upper_corner = camera_pos;
-  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(focus_dist, cam_w));
-  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_u));
-  vec3_inplace_sub(&viewport_left_upper_corner, vec3_scale(0.5f, viewport_v));
+  hittable_list_add(&world, &sphere1);
+  hittable_list_add(&world, &sphere2);
 
-  f32 defocus_radius = focus_dist * tan((defocus_angle / 2.0f) * pi / 180.0f);
-  vec3 defocus_disk_u = vec3_scale(defocus_radius, cam_u);
-  vec3 defocus_disk_v = vec3_scale(defocus_radius, cam_v);
+  RenderSettings settings = {0};
+  settings.img_ratio = 16.0f / 9.0f;
+  settings.img_width = 400;
+  settings.samples_per_pixel = 100;
+  settings.max_bounces = 50;
+  settings.vfov = 20.0f;
+  settings.lookfrom = Vec3(13.0f, 2.0f, 3.0f);
+  settings.lookat = Vec3(0.0f, 0.0f, 0.0f);
+  settings.view_up = Vec3(0.0f, 0.1f, 0.0f);
+  settings.defocus_angle = 0.0f;
 
-	vec3 current_pixel_center = viewport_left_upper_corner;
-  vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_v));
-  vec3_inplace_add(&current_pixel_center, vec3_scale(0.5f, pixel_delta_u));
-	
-  vec3 *pixels_colors = calloc(img_height * img_width, sizeof(vec3));
+  render_w_settings(&world, &settings);
+}
 
-  f64 time_start = timer_start_ms();
-  f64 time_start_s = timer_start();
-	for (i32 i = 0; i < img_height; ++i) {
-		for (i32 j = 0; j < img_width; ++j) {
-      u64 curr_idx = i * img_width + j;
-      vec3 current_ray_direction = 
-          vec3_add(
-            current_pixel_center, vec3_add(
-              vec3_scale((f32)i, pixel_delta_v),
-              vec3_scale((f32)j, pixel_delta_u)));
-      for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
-        Ray sampling_ray = {0};
-        sampling_ray.origin = (defocus_angle <= 0) ?
-          camera_pos : defocus_disk_sample(camera_pos, defocus_disk_u, defocus_disk_v);
-        f32 x_offset = random_f32() - 0.5f;
-        f32 y_offset = random_f32() - 0.5f;
-        sampling_ray.direction = vec3_sub(current_ray_direction, sampling_ray.origin);
-        vec3_inplace_add(&sampling_ray.direction, vec3_scale(x_offset, pixel_delta_u));
-        vec3_inplace_add(&sampling_ray.direction, vec3_scale(y_offset, pixel_delta_v));
-        sampling_ray.intersection_time = random_f32();
+void earth_scene() {
+  Texture earth_texture = make_image_texture("earthmap.jpg");
+  Material earth_surface = make_lambertian(&earth_texture);
 
-        vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(&sampling_ray, max_bounces, optimized_world));
-      }
-      vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
-		}
-	}
-  f64 time_elapsed = timer_stop_ms(time_start);
-  printf("Rendering time: %fms\n", time_elapsed);
-  f64 time_elapsed_s = timer_stop(time_start_s);
-  printf("Rendering time: %fs\n", time_elapsed_s);
+  Hittable globe = make_hittable_sphere(Vec3(0,0,0), 2.0f, earth_surface);
 
-  pixels_to_ppm(pixels_colors, img_width, img_height);
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList world = {0};
+  world.objects = hittables;
+  world.size = WORLD_SIZE;
+  hittable_list_add(&world, &globe);
+
+  RenderSettings settings = g_default_render_settings;
+  settings.img_width = 400;
+  settings.samples_per_pixel = 100;
+  settings.lookfrom = Vec3(0, 0, 12);
+  settings.lookat = Vec3(0, 0, 0);
+  settings.defocus_angle = 0;
+
+  render_w_settings(&world, &settings);
+}
+
+i32 main() {
+  // vec3_to_unit_vec_test();
+
+  // bouncing_spheres_scene();
+  // checkered_spheres_scene();
+  earth_scene();
 }
