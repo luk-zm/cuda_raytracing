@@ -9,9 +9,11 @@
 
 #include "vec3.h"
 #include "utility.h"
+#include "perlin_noise.h"
 
 #include "vec3.c" // unity build
 #include "utility.c"
+#include "perlin_noise.c"
 
 #define WORLD_SIZE 500
 
@@ -56,11 +58,17 @@ typedef struct {
   i32 height;
 } ImageTexture;
 
+typedef struct {
+  PerlinNoise *noise;
+  f32 scale;
+} NoiseTexture;
+
 typedef u32 TEXTURE;
 enum {
   TEXTURE_SOLID_COLOR,
   TEXTURE_CHECKER,
-  TEXTURE_IMAGE
+  TEXTURE_IMAGE,
+  TEXTURE_NOISE
 };
 
 struct Texture {
@@ -69,6 +77,7 @@ struct Texture {
     SolidColor solid_color;
     Checker checker;
     ImageTexture image_texture;
+    NoiseTexture noise_texture;
   };
 };
 
@@ -172,6 +181,14 @@ typedef struct {
   f32 v;
 } HitRecord;
 
+Texture make_noise_texture(PerlinNoise *noise, f32 scale) {
+  Texture result = {0};
+  result.type = TEXTURE_NOISE;
+  result.noise_texture.noise = noise;
+  result.noise_texture.scale = scale;
+  return result;
+}
+
 SolidColor make_solid_color(vec3 albedo) {
   SolidColor result = { albedo };
   return result;
@@ -235,6 +252,16 @@ vec3 texture_get_color(Texture *texture, f32 u, f32 v, vec3 point) {
       v = 1.0f - CLAMP(v, 0, 1);
       result =
         image_texture_get_pixel(img_tex, (i32)(u * img_tex->width), (i32)(v * img_tex->height));
+    } break;
+    case TEXTURE_NOISE: {
+      NoiseTexture *noise_tex = &texture->noise_texture;
+      result =
+        vec3_scale(1 + sinf(
+            noise_tex->scale * point.z + 10 * perlin_turbulence(
+                                                noise_tex->noise, 
+                                                point,
+                                                7)),
+            Color(0.5f, 0.5f, 0.5f));
     } break;
   }
   return result;
@@ -1099,10 +1126,35 @@ void earth_scene() {
   render_w_settings(&world, &settings);
 }
 
+void perlin_spheres_scene() {
+  PerlinNoise noise = make_perlin_noise();
+  Texture noise_tex = make_noise_texture(&noise, 4);
+  Hittable ground = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(&noise_tex));
+  Hittable sphere = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(&noise_tex));
+
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList world = {0};
+  world.objects = hittables;
+  world.size = WORLD_SIZE;
+  hittable_list_add(&world, &ground);
+  hittable_list_add(&world, &sphere);
+
+  RenderSettings settings = g_default_render_settings;
+  settings.img_width = 400;
+  settings.samples_per_pixel = 100;
+  settings.lookfrom = Vec3(13, 2, 3);
+  settings.lookat = Vec3(0, 0, 0);
+  settings.defocus_angle = 0;
+
+  render_w_settings(&world, &settings);
+}
+
 i32 main() {
   // vec3_to_unit_vec_test();
 
   // bouncing_spheres_scene();
   // checkered_spheres_scene();
-  earth_scene();
+  // earth_scene();
+  perlin_spheres_scene();
 }
