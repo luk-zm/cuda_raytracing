@@ -17,8 +17,6 @@
 
 #define WORLD_SIZE 500
 
-const float pi = 3.1415926535897932385f;
-
 typedef struct {
   u8 *data;
   u64 current_pos;
@@ -102,7 +100,8 @@ typedef u32 MaterialType;
 enum {
   MATERIAL_LAMBERTIAN,
   MATERIAL_METAL,
-  MATERIAL_DIELECTRIC
+  MATERIAL_DIELECTRIC,
+  MATERIAL_DIFFUSE_LIGHT
 };
 
 typedef struct Material {
@@ -116,6 +115,7 @@ typedef struct Material {
     struct {
       f32 refraction_index;
     } dielectric;
+    Texture *diffuse_light_texture;
   };
 } Material;
 
@@ -132,6 +132,17 @@ typedef struct {
   Aabb bounding_box;
 } Sphere;
 
+typedef struct {
+  vec3 q;
+  vec3 u;
+  vec3 v;
+  Material mat;
+  Aabb bounding_box;
+  vec3 normal;
+  f32 d;
+  vec3 w;
+} Quad;
+
 typedef struct Hittable Hittable;
 
 typedef struct {
@@ -144,7 +155,10 @@ typedef u32 VisObject;
 enum {
   VIS_OBJECT_SPHERE,
   VIS_OBJECT_BVH_NODE,
-  VIS_OBJECT_HITTABLE_LIST
+  VIS_OBJECT_HITTABLE_LIST,
+  VIS_OBJECT_QUAD,
+  VIS_OBJECT_TRANSLATION,
+  VIS_OBJECT_Y_ROTATION
 };
 
 typedef struct {
@@ -154,12 +168,28 @@ typedef struct {
   u64 count;
 } HittableList;
 
+typedef struct {
+  Hittable *object;
+  vec3 offset;
+  Aabb bounding_box;
+} Translation;
+
+typedef struct {
+  Hittable *object;
+  f32 sin_theta;
+  f32 cos_theta;
+  Aabb bounding_box;
+} YRotation;
+
 struct Hittable {
   VisObject type;
   union {
     Sphere sphere;
     BvhNode bvh_node;
     HittableList hlist;
+    Quad quad;
+    Translation translation;
+    YRotation y_rotation;
   };
 };
 
@@ -191,6 +221,12 @@ Texture make_noise_texture(PerlinNoise *noise, f32 scale) {
 
 SolidColor make_solid_color(vec3 albedo) {
   SolidColor result = { albedo };
+  return result;
+}
+
+Texture make_solid_color_texture(vec3 albedo) {
+  Texture result = { TEXTURE_SOLID_COLOR };
+  result.solid_color.albedo = albedo;
   return result;
 }
 
@@ -301,6 +337,18 @@ f32 reflectance(f32 cos, f32 refraction_index) {
   return r0 + (1.0f - r0) * powf(1.0f - cos, 5.0f);
 }
 
+vec3 material_emit(Material *mat, f32 u, f32 v, vec3 point) {
+  vec3 result = {0};
+  switch (mat->type) {
+    case MATERIAL_DIFFUSE_LIGHT: {
+      result = texture_get_color(mat->diffuse_light_texture, u, v, point);
+    } break;
+    default:
+      result = Vec3(0, 0, 0);
+  }
+  return result;
+}
+
 ScatterRes material_scatter(Material *mat, vec3 r_in_direction, HitRecord *record) {
   ScatterRes result = {0};
   switch (mat->type) {
@@ -370,6 +418,34 @@ Material make_dielectric(f32 refraction_index) {
   return result;
 }
 
+Material make_diffuse_light(Texture *texture) {
+  Material result = {0};
+  result.type = MATERIAL_DIFFUSE_LIGHT;
+  result.diffuse_light_texture = texture;
+  return result;
+}
+
+Aabb aabb_add_offset(Aabb *bbox, vec3 offset) {
+  Aabb result = *bbox;
+  result.x0 += offset.x;
+  result.x1 += offset.x;
+  result.y0 += offset.y;
+  result.y1 += offset.y;
+  result.z0 += offset.z;
+  result.z1 += offset.z;
+  return result;
+}
+
+void aabb_pad_to_minimums(Aabb *bbox) {
+  f32 delta = 0.0001f;
+  if ((bbox->x1 - bbox->x0) < delta)
+    interval_expand(&bbox->x0, &bbox->x1, delta);
+  if ((bbox->y1 - bbox->y0) < delta)
+    interval_expand(&bbox->y0, &bbox->y1, delta);
+  if ((bbox->z1 - bbox->z0) < delta)
+    interval_expand(&bbox->z0, &bbox->z1, delta);
+}
+
 Aabb make_aabb(vec3 p1, vec3 p2) {
   Aabb result = {0};
   result.x0 = MIN(p1.x, p2.x);
@@ -378,6 +454,7 @@ Aabb make_aabb(vec3 p1, vec3 p2) {
   result.y1 = MAX(p1.y, p2.y);
   result.z0 = MIN(p1.z, p2.z);
   result.z1 = MAX(p1.z, p2.z);
+  aabb_pad_to_minimums(&result);
   return result;
 }
 
@@ -389,6 +466,7 @@ Aabb aabb_merge(Aabb *a, Aabb *b) {
   result.y1 = MAX(a->y1, b->y1);
   result.z0 = MIN(a->z0, b->z0);
   result.z1 = MAX(a->z1, b->z1);
+  aabb_pad_to_minimums(&result);
   return result;
 }
 
@@ -401,14 +479,32 @@ void sphere_get_uv(vec3 *point, f32 *u, f32 *v) {
 }
 
 Sphere make_sphere(vec3 center, f32 radius, Material mat) {
-  Sphere s = { make_movement_path(center, Vec3(0.0f, 0.0f, 0.0f)), radius, mat };
+  Sphere result = { make_movement_path(center, Vec3(0.0f, 0.0f, 0.0f)), radius, mat };
   vec3 radius_vec = { radius, radius, radius };
-  s.bounding_box = make_aabb(vec3_sub(center, radius_vec), vec3_add(center, radius_vec));
-  return s;
+  result.bounding_box = make_aabb(vec3_sub(center, radius_vec), vec3_add(center, radius_vec));
+  return result;
 }
 
 Hittable make_hittable_sphere(vec3 center, f32 radius, Material mat) {
   Hittable result = { VIS_OBJECT_SPHERE, make_sphere(center, radius, mat) };
+  return result;
+}
+
+Quad make_quad(vec3 q, vec3 u, vec3 v, Material mat) {
+  Quad result = { q, u, v, mat };
+  Aabb bbox1 = make_aabb(q, vec3_add(q, vec3_add(u, v)));
+  Aabb bbox2 = make_aabb(vec3_add(q, u), vec3_add(q, v));
+  result.bounding_box = aabb_merge(&bbox1, &bbox2);
+  vec3 n = vec3_cross_product(u, v);
+  result.w = vec3_scale(1.0f/vec3_dot_prod(n, n), n);
+  result.normal = vec3_to_unit_vec(n);
+  result.d = vec3_dot_prod(result.normal, q);
+  return result;
+}
+
+Hittable make_hittable_quad(vec3 q, vec3 u, vec3 v, Material mat) {
+  Hittable result = { VIS_OBJECT_QUAD };
+  result.quad = make_quad(q, u, v, mat);
   return result;
 }
 
@@ -434,6 +530,15 @@ Aabb *hittable_get_bounding_box(Hittable *hittable) {
     } break;
     case VIS_OBJECT_HITTABLE_LIST: {
       result = &hittable->hlist.bounding_box;
+    } break;
+    case VIS_OBJECT_QUAD: {
+      result = &hittable->quad.bounding_box;
+    } break;
+    case VIS_OBJECT_TRANSLATION: {
+      result = &hittable->translation.bounding_box;
+    } break;
+    case VIS_OBJECT_Y_ROTATION: {
+      result = &hittable->y_rotation.bounding_box;
     } break;
   }
   return result;
@@ -511,6 +616,51 @@ void hittable_list_sort_bound(HittableList *list, u64 start, u64 end,
   hittable_list_split_merge(list->objects, hittables_copy, start, end, type);
 }
 
+Hittable make_hittable_translation(Hittable *object, vec3 offset) {
+  Hittable result = { VIS_OBJECT_TRANSLATION };
+  result.translation.object = object;
+  result.translation.offset = offset;
+  result.translation.bounding_box = aabb_add_offset(hittable_get_bounding_box(object), offset);
+  return result;
+}
+
+Hittable make_hittable_y_rotation(Hittable *object, f32 angle) {
+  Hittable result = { VIS_OBJECT_Y_ROTATION };
+  result.y_rotation.object = object;
+  f32 radians = degrees_to_radians(angle);
+  result.y_rotation.sin_theta = sinf(radians);
+  result.y_rotation.cos_theta = cosf(radians);
+  result.y_rotation.bounding_box = *hittable_get_bounding_box(object);
+
+  YRotation *yrot = &result.y_rotation;
+
+  vec3 min = { INFINITY, INFINITY, INFINITY };
+  vec3 max = { -INFINITY, -INFINITY, -INFINITY };
+
+  for (i32 i = 0; i < 2; ++i) {
+    for (i32 j = 0; j < 2; ++j) {
+      for (i32 k = 0; k < 2; ++k) {
+        f32 x = i*yrot->bounding_box.x1 + (1-i)*yrot->bounding_box.x0;
+        f32 y = i*yrot->bounding_box.y1 + (1-j)*yrot->bounding_box.y0;
+        f32 z = i*yrot->bounding_box.z1 + (1-k)*yrot->bounding_box.z0;
+
+        f32 new_x = yrot->cos_theta*x + yrot->sin_theta*z;
+        f32 new_z = -yrot->sin_theta*x + yrot->cos_theta*z;
+
+        vec3 tmp = { new_x, y, new_z };
+        min.x = MIN(min.x, tmp.x);
+        max.x = MAX(max.x, tmp.x);
+        min.y = MIN(min.y, tmp.y);
+        max.y = MAX(max.y, tmp.y);
+        min.z = MIN(min.z, tmp.z);
+        max.z = MAX(max.z, tmp.z);
+      }
+    }
+  }
+  result.y_rotation.bounding_box = make_aabb(min, max);
+  return result;
+}
+
 Hittable *make_bvh_node_from_hittable_list_bound(MemArena *arena, HittableList *list,
     u64 start, u64 end) {
   Hittable *result = mem_arena_push(arena, sizeof(Hittable));
@@ -566,12 +716,35 @@ Hittable *make_bvh_node_from_hittable_list(MemArena *arena, HittableList *list) 
   return make_bvh_node_from_hittable_list_bound(arena, list, 0, list->count);
 }
 
-void hittable_list_add(HittableList *list, Hittable *hittable) {
+void hittable_list_add(HittableList *list, Hittable hittable) {
   if (list->count < list->size) {
-    list->objects[list->count++] = *hittable;
-    Aabb *other_bbox = hittable_get_bounding_box(hittable);
+    list->objects[list->count++] = hittable;
+    Aabb *other_bbox = hittable_get_bounding_box(&hittable);
     list->bounding_box = aabb_merge(&list->bounding_box, other_bbox);
   }
+}
+
+Hittable *make_box(MemArena *arena, vec3 a, vec3 b, Material mat) {
+  Hittable *sides = mem_arena_push(arena, sizeof(Hittable));
+  sides->type = VIS_OBJECT_HITTABLE_LIST;
+  sides->hlist.size = 6;
+  sides->hlist.count = 0;
+  sides->hlist.objects = mem_arena_push(arena, sizeof(Hittable) * 6);
+
+  vec3 min = { MIN(a.x, b.x), MIN(a.y, b.y), MIN(a.z, b.z) };
+  vec3 max = { MAX(a.x, b.x), MAX(a.y, b.y), MAX(a.z, b.z) };
+
+  vec3 dx = { max.x - min.x, 0, 0 };
+  vec3 dy = { 0, max.y - min.y, 0 };
+  vec3 dz = { 0, 0, max.z - min.z };
+
+  hittable_list_add(&sides->hlist, make_hittable_quad(Vec3(min.x, min.y, max.z), dx, dy, mat));
+  hittable_list_add(&sides->hlist, make_hittable_quad(Vec3(max.x, min.y, max.z), vec3_sign_flip(dz), dy, mat));
+  hittable_list_add(&sides->hlist, make_hittable_quad(Vec3(max.x, min.y, min.z), vec3_sign_flip(dx), dy, mat));
+  hittable_list_add(&sides->hlist, make_hittable_quad(Vec3(min.x, min.y, min.z), dz, dy, mat));
+  hittable_list_add(&sides->hlist, make_hittable_quad(Vec3(min.x, max.y, max.z), dx, vec3_sign_flip(dz), mat));
+  hittable_list_add(&sides->hlist, make_hittable_quad(Vec3(min.x, min.y, min.z), dx, dz, mat));
+  return sides;
 }
 
 // outward_normal is of unit length
@@ -651,33 +824,109 @@ b32 hit(Hittable *hittable, f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *rec
     case VIS_OBJECT_HITTABLE_LIST: {
       return hittable_list_hit(&hittable->hlist, ray, ray_tmin, ray_tmax, record);
     } break;
+    case VIS_OBJECT_QUAD: {
+      Quad *quad = &hittable->quad;
+      b32 is_hit = 0;
+      f32 denom = vec3_dot_prod(quad->normal, ray->direction);
+      if (fabsf(denom) >= 1e-8) {
+        f32 t = (quad->d - vec3_dot_prod(quad->normal, ray->origin)) / denom;
+        if (ray_tmin <= t && t <= ray_tmax) {
+          vec3 intersection = ray_at(ray, t);
+          vec3 planar_hit_point = vec3_sub(intersection, quad->q);
+          f32 alpha = vec3_dot_prod(quad->w, vec3_cross_product(planar_hit_point, quad->v));
+          f32 beta = vec3_dot_prod(quad->w, vec3_cross_product(quad->u, planar_hit_point));
+          if ((0.0f <= alpha && alpha <= 1.0f) && (0.0f <= beta && beta <= 1.0f)) {
+            record->u = alpha;
+            record->v = beta;
+            record->t = t;
+            record->point_hit = intersection;
+            record->mat = quad->mat;
+            hit_record_set_face_normal(record, ray, quad->normal);
+            is_hit = 1;
+          }
+        }
+      }
+      return is_hit;
+    } break;
+    case VIS_OBJECT_TRANSLATION: {
+      Translation *translation = &hittable->translation;
+      Ray offset_ray = { vec3_sub(ray->origin, translation->offset),
+        ray->direction,
+        ray->intersection_time };
+      if (hit(translation->object, ray_tmin, ray_tmax, &offset_ray, record)) {
+        vec3_inplace_add(&record->point_hit, translation->offset);
+        return 1;
+      } else {
+        return 0;
+      }
+    } break;
+    case VIS_OBJECT_Y_ROTATION: {
+      YRotation *y_rot = &hittable->y_rotation;
+      vec3 rotated_origin = Vec3(
+          (y_rot->cos_theta * ray->origin.x) - (y_rot->sin_theta * ray->origin.z),
+          ray->origin.y,
+          (y_rot->sin_theta * ray->origin.x) + (y_rot->cos_theta * ray->origin.z)
+      );
+
+      vec3 rotated_direction = Vec3(
+          (y_rot->cos_theta * ray->direction.x) - (y_rot->sin_theta * ray->direction.z),
+          ray->direction.y,
+          (y_rot->sin_theta * ray->direction.x) + (y_rot->cos_theta * ray->direction.z)
+      );
+
+      Ray rotated_ray = { rotated_origin, rotated_direction, ray->intersection_time };
+
+      if (hit(y_rot->object, ray_tmin, ray_tmax, &rotated_ray, record)) {
+        record->point_hit = Vec3(
+            (y_rot->cos_theta * record->point_hit.x) + (y_rot->sin_theta * record->point_hit.z),
+            record->point_hit.y,
+            (-y_rot->sin_theta * record->point_hit.x) + (y_rot->cos_theta * record->point_hit.z)
+        );
+
+        record->normal = Vec3(
+            (y_rot->cos_theta * record->normal.x) + (y_rot->sin_theta * record->normal.z),
+            record->normal.y,
+            (-y_rot->sin_theta * record->normal.x) + (y_rot->cos_theta * record->normal.z)
+        );
+        return 1;
+      } else {
+        return 0;
+      }
+    } break;
   }
   return 0;
 }
 
-vec3 ray_color(Ray *ray, i32 max_bounces, Hittable *world) {
-  if (max_bounces <= 0)
-    return Color(0, 0, 0);
-
-  HitRecord record = {0};
-  if (hit(world, 0.001f, INFINITY, ray, &record)) {
-    ScatterRes scatter = material_scatter(&record.mat, ray->direction, &record);
-    if (scatter.is_hit) {
-      Ray bounce = {0};
-      bounce.origin = record.point_hit;
-      bounce.direction = scatter.direction;
-      bounce.intersection_time = ray->intersection_time;
-      return vec3_comp_scale(scatter.attenuation,
-          ray_color(&bounce, max_bounces - 1, world));
+vec3 ray_color(Ray *ray, i32 max_bounces, Hittable *world, vec3 background_color) {
+  vec3 result = {0};
+  if (max_bounces > 0) {
+    HitRecord record = {0};
+    if (hit(world, 0.001f, INFINITY, ray, &record)) {
+      vec3 emission_color = material_emit(&record.mat, record.u, record.v, record.point_hit);
+      ScatterRes scatter = material_scatter(&record.mat, ray->direction, &record);
+      if (scatter.is_hit) {
+        Ray bounce = {0};
+        bounce.origin = record.point_hit;
+        bounce.direction = scatter.direction;
+        bounce.intersection_time = ray->intersection_time;
+        vec3 scatter_color = vec3_comp_scale(scatter.attenuation,
+            ray_color(&bounce, max_bounces - 1, world, background_color));
+        result = vec3_add(scatter_color, emission_color);
+      } else {
+        result = emission_color;
+      }
     } else {
-      return Color(0, 0, 0);
+      result = background_color;
     }
   }
 
+#if 0
   vec3 unit_direction = vec3_to_unit_vec(ray->direction);
   f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
   return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
       vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
+#endif
+  return result;
 }
 
 b32 hittable_list_hit(HittableList *list, Ray *ray,
@@ -913,11 +1162,12 @@ typedef struct {
   vec3 lookat;
   vec3 view_up;
   f32 defocus_angle;
+  vec3 background_color;
 } RenderSettings;
 
 static RenderSettings g_default_render_settings = 
   { 16.0f/9.0f, 1200, 10, 50, 20.0f, { 13.0f, 2.0f, 3.0f },
-    { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f };
+    { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f, {0.7f, 0.8f, 1.0f} };
 
 void render_w_settings(HittableList *world, RenderSettings *settings) {
   MemArena nodes_arena = {0};
@@ -991,7 +1241,10 @@ void render_w_settings(HittableList *world, RenderSettings *settings) {
         sampling_ray.intersection_time = random_f32();
 
         vec3_inplace_add(&pixels_colors[curr_idx],
-            ray_color(&sampling_ray, settings->max_bounces, optimized_world));
+            ray_color(&sampling_ray, 
+              settings->max_bounces, 
+              optimized_world,
+              settings->background_color));
       }
       vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
 		}
@@ -1026,7 +1279,7 @@ void bouncing_spheres_scene() {
 
   Material material_ground = make_lambertian(&checker_texture);
   Hittable ground = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, -1000.0f, 0.0f), 1000.0f, material_ground) };
-  hittable_list_add(&world, &ground);
+  hittable_list_add(&world, ground);
 
   for (i32 a = -11; a < 11; ++a) {
     for (i32 b = -11; b < 11; ++b) {
@@ -1041,7 +1294,7 @@ void bouncing_spheres_scene() {
           vec3 sphere_direction = Vec3(0.0f, random_f32_bound(0.0f, 0.5f), 0.0f);
           Hittable obj = { VIS_OBJECT_SPHERE, 
             make_moving_sphere(center, sphere_direction, 0.2f, current_material) };
-          hittable_list_add(&world, &obj);
+          hittable_list_add(&world, obj);
         } else {
           if (material_choice < 0.95f) {
             vec3 albedo = vec3_random_bound(0.5f, 1.0f);
@@ -1051,7 +1304,7 @@ void bouncing_spheres_scene() {
             current_material = make_dielectric(1.5f);
           }
           Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
-          hittable_list_add(&world, &obj);
+          hittable_list_add(&world, obj);
         }
       }
     }
@@ -1059,15 +1312,15 @@ void bouncing_spheres_scene() {
 
   Material mat1 = make_dielectric(1.5f);
   Hittable big_sphere1 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, 1.0f, 0.0f), 1.0f, mat1) };
-  hittable_list_add(&world, &big_sphere1);
+  hittable_list_add(&world, big_sphere1);
 
   Material mat2 = make_lambertian_solid_color(&texture_arena, Vec3(0.4f, 0.2f, 0.1f));
   Hittable big_sphere2 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(-4.0f, 1.0f, 0.0f), 1.0f, mat2) };
-  hittable_list_add(&world, &big_sphere2);
+  hittable_list_add(&world, big_sphere2);
 
   Material mat3 = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.0f);
   Hittable big_sphere3 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(4.0f, 1.0f, 0.0f), 1.0f, mat3) };
-  hittable_list_add(&world, &big_sphere3);
+  hittable_list_add(&world, big_sphere3);
 
   render(&world);
 }
@@ -1086,8 +1339,8 @@ void checkered_spheres_scene() {
   Hittable sphere1 = make_hittable_sphere(Vec3(0.0f, -10.0f, 0.0f), 10.0f, make_lambertian(&checker_texture));
   Hittable sphere2 = make_hittable_sphere(Vec3(0.0f, 10.0f, 0.0f), 10.0f, make_lambertian(&checker_texture));
 
-  hittable_list_add(&world, &sphere1);
-  hittable_list_add(&world, &sphere2);
+  hittable_list_add(&world, sphere1);
+  hittable_list_add(&world, sphere2);
 
   RenderSettings settings = {0};
   settings.img_ratio = 16.0f / 9.0f;
@@ -1099,6 +1352,7 @@ void checkered_spheres_scene() {
   settings.lookat = Vec3(0.0f, 0.0f, 0.0f);
   settings.view_up = Vec3(0.0f, 0.1f, 0.0f);
   settings.defocus_angle = 0.0f;
+  settings.background_color = Vec3(0.7f, 0.8f, 1.0f);
 
   render_w_settings(&world, &settings);
 }
@@ -1114,7 +1368,7 @@ void earth_scene() {
   HittableList world = {0};
   world.objects = hittables;
   world.size = WORLD_SIZE;
-  hittable_list_add(&world, &globe);
+  hittable_list_add(&world, globe);
 
   RenderSettings settings = g_default_render_settings;
   settings.img_width = 400;
@@ -1137,8 +1391,8 @@ void perlin_spheres_scene() {
   HittableList world = {0};
   world.objects = hittables;
   world.size = WORLD_SIZE;
-  hittable_list_add(&world, &ground);
-  hittable_list_add(&world, &sphere);
+  hittable_list_add(&world, ground);
+  hittable_list_add(&world, sphere);
 
   RenderSettings settings = g_default_render_settings;
   settings.img_width = 400;
@@ -1150,11 +1404,137 @@ void perlin_spheres_scene() {
   render_w_settings(&world, &settings);
 }
 
+void quads_scene() {
+  MemArena texture_arena = {0};
+  mem_arena_alloc(&texture_arena, sizeof(Texture) * 10);
+  
+  Hittable left_quad = make_hittable_quad(Vec3(-3,-2, 5), Vec3(0, 0,-4), Vec3(0, 4, 0), 
+      make_lambertian_solid_color(&texture_arena, Vec3(1.0f, 0.2f, 0.2f)));
+  Hittable back_quad = make_hittable_quad(Vec3(-2,-2, 0), Vec3(4, 0, 0), Vec3(0, 4, 0),
+      make_lambertian_solid_color(&texture_arena, Vec3(0.2f, 1.0f, 0.2f)));
+  Hittable right_quad = make_hittable_quad(Vec3(3,-2, 1), Vec3(0, 0, 4), Vec3(0, 4, 0),
+      make_lambertian_solid_color(&texture_arena, Vec3(0.2f, 0.2f, 1.0f)));
+  Hittable upper_quad = make_hittable_quad(Vec3(-2, 3, 1), Vec3(4, 0, 0), Vec3(0, 0, 4),
+      make_lambertian_solid_color(&texture_arena, Vec3(1.0f, 0.5f, 0.0f)));
+  Hittable lower_quad = make_hittable_quad(Vec3(-2,-3, 5), Vec3(4, 0, 0), Vec3(0, 0,-4),
+      make_lambertian_solid_color(&texture_arena, Vec3(0.2f, 0.8f, 0.8f)));
+
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList world = {0};
+  world.objects = hittables;
+  world.size = WORLD_SIZE;
+  hittable_list_add(&world, left_quad);
+  hittable_list_add(&world, back_quad);
+  hittable_list_add(&world, right_quad);
+  hittable_list_add(&world, upper_quad);
+  hittable_list_add(&world, lower_quad);
+
+  RenderSettings settings = {0};
+  settings.img_ratio = 1.0f;
+  settings.img_width = 400;
+  settings.samples_per_pixel = 100;
+  settings.max_bounces = 50;
+  settings.vfov = 80;
+  settings.lookfrom = Vec3(0, 0, 9);
+  settings.lookat = Vec3(0, 0, 0);
+  settings.view_up = Vec3(0, 1, 0);
+  settings.defocus_angle = 0;
+  settings.background_color = Vec3(0.7f, 0.8f, 1.0f);
+
+  render_w_settings(&world, &settings);
+}
+
+void simple_light_scene() {
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList world = {0};
+  world.objects = hittables;
+  world.size = WORLD_SIZE;
+
+  PerlinNoise noise = make_perlin_noise();
+  Texture perlin_texture = make_noise_texture(&noise, 4);
+  Hittable sphere1 = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(&perlin_texture));
+  Hittable sphere2 = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(&perlin_texture));
+
+  Texture sc = make_solid_color_texture(Vec3(4, 4, 4));
+  Hittable light_quad =
+    make_hittable_quad(Vec3(3, 1, -2), Vec3(2, 0, 0), Vec3(0, 2, 0), make_diffuse_light(&sc));
+  Hittable light_sphere = make_hittable_sphere(Vec3(0, 7, 0), 2, make_diffuse_light(&sc));
+
+  hittable_list_add(&world, sphere1);
+  hittable_list_add(&world, sphere2);
+  hittable_list_add(&world, light_quad);
+  hittable_list_add(&world, light_sphere);
+
+  RenderSettings settings = {0};
+  settings.img_ratio = 16.0f / 9.0f;
+  settings.img_width = 400;
+  settings.samples_per_pixel = 100;
+  settings.max_bounces = 50;
+  settings.vfov = 20;
+  settings.lookfrom = Vec3(26, 3, 6);
+  settings.lookat = Vec3(0, 2, 0);
+  settings.view_up = Vec3(0, 1, 0);
+
+  render_w_settings(&world, &settings);
+}
+
+void cornell_box_scene() {
+  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList world = {0};
+  world.objects = hittables;
+  world.size = WORLD_SIZE;
+
+  MemArena scene_arena = {0};
+  mem_arena_alloc(&scene_arena, MB(1));
+
+  Material red = make_lambertian_solid_color(&scene_arena, Vec3(0.65f, 0.05f, 0.05f));
+  Material white = make_lambertian_solid_color(&scene_arena, Vec3(0.73f, 0.73f, 0.73f));
+  Material green = make_lambertian_solid_color(&scene_arena, Vec3(0.12f, 0.45f, 0.15f));
+  Texture light_col = make_solid_color_texture(Vec3(15, 15, 15));
+  Material light = make_diffuse_light(&light_col);
+  
+  hittable_list_add(&world, make_hittable_quad(Vec3(555,0,0), Vec3(0,555,0), Vec3(0,0,555), green));
+  hittable_list_add(&world, make_hittable_quad(Vec3(0,0,0), Vec3(0,555,0), Vec3(0,0,555), red));
+  hittable_list_add(&world, make_hittable_quad(Vec3(343, 554, 332), Vec3(-130,0,0), Vec3(0,0,-105), light));
+  hittable_list_add(&world, make_hittable_quad(Vec3(0,0,0), Vec3(555,0,0), Vec3(0,0,555), white));
+  hittable_list_add(&world, make_hittable_quad(Vec3(555,555,555), Vec3(-555,0,0), Vec3(0,0,-555), white));
+  hittable_list_add(&world, make_hittable_quad(Vec3(0,0,555), Vec3(555,0,0), Vec3(0,555,0), white));
+
+  Hittable *box1 = make_box(&scene_arena, Vec3(0, 0, 0), Vec3(165, 330, 165), white);
+  Hittable box1t = make_hittable_y_rotation(box1, 15);
+  Hittable box1tr = make_hittable_translation(&box1t, Vec3(265, 0, 295));
+  hittable_list_add(&world, box1tr);
+
+  Hittable *box2 = make_box(&scene_arena, Vec3(0, 0, 0), Vec3(165, 165, 165), white);
+  Hittable box2t = make_hittable_y_rotation(box2, -18);
+  Hittable box2tr = make_hittable_translation(&box2t, Vec3(130, 0, 65));
+  hittable_list_add(&world, box2tr);
+
+  RenderSettings settings = {0};
+  settings.img_ratio = 1.0f;
+  settings.img_width = 600;
+  settings.samples_per_pixel = 200;
+  settings.max_bounces = 50;
+  settings.vfov = 40;
+  settings.lookfrom = Vec3(278, 278, -800);
+  settings.lookat = Vec3(278, 278, 0);
+  settings.view_up = Vec3(0, 1, 0);
+  settings.defocus_angle = 0;
+
+  render_w_settings(&world, &settings);
+}
+
 i32 main() {
   // vec3_to_unit_vec_test();
 
   // bouncing_spheres_scene();
   // checkered_spheres_scene();
   // earth_scene();
-  perlin_spheres_scene();
+  // perlin_spheres_scene();
+  // quads_scene();
+  // simple_light_scene();
+  cornell_box_scene();
 }

@@ -49,6 +49,12 @@ b32 interval_overlap(f32 x0, f32 x1, f32 y0, f32 y1) {
   return shared_min < shared_max;
 }
 
+void interval_expand(f32 *min, f32 *max, f32 delta) {
+  f32 padding = delta / 2;
+  *min -= padding;
+  *max += padding;
+}
+
 void interval_sort(f32 *x0, f32 *x1) {
   if (*x0 > *x1) {
     f32 temp = *x0;
@@ -61,3 +67,7 @@ vec3 line_at(vec3 origin, f32 t, vec3 direction) {
   return vec3_add(origin, vec3_scale(t, direction));
 }
 
+f32 degrees_to_radians(f32 angle) {
+  f32 result = angle * (pi / 180);
+  return result;
+}
