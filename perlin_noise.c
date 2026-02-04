@@ -1,4 +1,5 @@
-f32 perlin_interp(vec3 c[2][2][2], f32 u, f32 v, f32 w) {
+__host__ __device__
+inline f32 perlin_interp(vec3 c[2][2][2], f32 u, f32 v, f32 w) {
   f32 uu = u*u*(3 - 2*u);
   f32 vv = v*v*(3 - 2*v);
   f32 ww = w*w*(3 - 2*w);
@@ -18,7 +19,8 @@ f32 perlin_interp(vec3 c[2][2][2], f32 u, f32 v, f32 w) {
   return accum;
 }
 
-f32 perlin_noise_val(PerlinNoise *noise, vec3 point) {
+__host__ __device__
+inline f32 perlin_noise_val(PerlinNoise *noise, vec3 point) {
   f32 u = point.x - floorf(point.x);
   f32 v = point.y - floorf(point.y);
   f32 w = point.z - floorf(point.z);
@@ -67,7 +69,8 @@ PerlinNoise make_perlin_noise() {
   return result;
 }
 
-f32 perlin_turbulence(PerlinNoise *noise, vec3 point, i32 depth) {
+__host__ __device__
+inline f32 perlin_turbulence(PerlinNoise *noise, vec3 point, i32 depth) {
   f32 accum = 0.0f;
   vec3 tmp_p = point;
   f32 weight = 1.0f;
