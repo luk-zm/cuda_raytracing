@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include <assert.h>
 #include <curand_kernel.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "include/stb_image.h"
@@ -44,7 +45,25 @@ void mem_arena_free(MemArena *arena) {
   arena->size = 0;
 }
 
-typedef u64 HittableRef;
+typedef MemArena GpuMemArena;
+
+void gpu_mem_arena_alloc(MemArena *arena, u64 size) {
+  arena->size = size;
+  (u8 *)cudaMalloc(&arena->data, size);
+  arena->current_pos = 0;
+}
+
+void *gpu_mem_arena_push(MemArena *arena, u64 size) {
+  return mem_arena_push(arena, size);
+}
+
+void gpu_mem_arena_free(MemArena *arena) {
+  cudaFree(arena->data);
+  arena->current_pos = 0;
+  arena->size = 0;
+}
+
+typedef u16 HittableRef;
 
 typedef struct {
   HittableRef *data;
@@ -168,10 +187,11 @@ typedef struct {
 } Quad;
 
 typedef struct Hittable Hittable;
+typedef HittableRef WorldRef;
 
 typedef struct {
-  u64 left;
-  u64 right;
+  WorldRef left;
+  WorldRef right;
   Aabb bounding_box;
 } BvhNode;
 
@@ -194,7 +214,7 @@ typedef struct {
 } HittableList;
 
 typedef struct {
-  u64 idx;
+  HittableRef idx;
   Aabb bounding_box;
   u64 size;
   u64 count;
@@ -251,26 +271,32 @@ typedef struct {
 
 typedef struct {
   RayColorStackData *data;
-  u64 max_count;
-  u64 count;
+  u8 max_count;
+  u8 count;
 } RayColorStack;
 
 typedef struct {
   HittableRef *data;
-  u64 max_count;
-  u64 count;
+  u16 max_count;
+  u16 count;
 } HittableRefStack;
 
 typedef struct {
-  HittableList *hittables;
-  TextureList *textures;
-  HittableRef root_bvh_node;
+  HittableList hittables;
+  TextureList textures;
+  HittableRefList world;
+  WorldRef root_bvh_node;
 } SceneData;
 
 typedef struct {
-  RayColorStack *rc_stack;
-  HittableRefStack *hit_stack;
-} GpuData;
+  RayColorStack rc_stack;
+  HittableRefStack hit_stack;
+} PerPixelGpuData;
+
+__host__ __device__
+inline HittableRef wref_to_href(HittableRefList *world, WorldRef ref) {
+  return world->data[ref];
+}
 
 HittableRefList make_hittable_ref_list(MemArena *arena, u64 size) {
   HittableRefList result = {0};
@@ -280,9 +306,11 @@ HittableRefList make_hittable_ref_list(MemArena *arena, u64 size) {
   return result;
 }
 
-void hittable_ref_list_add(HittableRefList *list, HittableRef tex) {
+u64 hittable_ref_list_add(HittableRefList *list, HittableRef tex) {
+  u64 result = list->count;
   if (list->count < list->size)
     list->data[list->count++] = tex;
+  return result;
 }
 
 TextureRef texture_list_add(TextureList *list, Texture tex) {
@@ -540,8 +568,8 @@ Material make_diffuse_light(TextureRef texture) {
   return result;
 }
 
-Aabb aabb_add_offset(Aabb *bbox, vec3 offset) {
-  Aabb result = *bbox;
+Aabb aabb_add_offset(Aabb bbox, vec3 offset) {
+  Aabb result = bbox;
   result.x0 += offset.x;
   result.x1 += offset.x;
   result.y0 += offset.y;
@@ -682,13 +710,13 @@ b32 hittable_list_comparison(HittableList *hittables, HittableRef *arr, u64 i, u
   return comp;
 }
 
-void hittable_list_merge(HittableList *hittables, HittableRef *arr, HittableRef *tmp, u64 start, u64 mid, u64 end,
-    HITTABLE_LIST_COMP_TYPE type) {
+void hittable_list_merge(HittableList *hittables, HittableRef *arr, HittableRef *tmp,
+    u64 start, u64 mid, u64 end, HITTABLE_LIST_COMP_TYPE type) {
   u64 start_max = mid - 1;
   u64 tmp_pos = start;
   u64 count = end - start + 1;
 
-  while ((end <= start_max) && (mid <= end)) {
+  while ((start <= start_max) && (mid <= end)) {
     if (hittable_list_comparison(hittables, arr, start, mid, type)) {
       tmp[tmp_pos] = arr[start];
       tmp_pos = tmp_pos + 1;
@@ -732,23 +760,23 @@ void hittable_list_sort_bound(HittableList *hittables, HittableRefList *list, u6
     HITTABLE_LIST_COMP_TYPE type) {
   MemArena copy_arena = {0};
   mem_arena_alloc(&copy_arena, list->count * sizeof(HittableRef));
-  HittableRef *hittables_copy = 
+  HittableRef *list_data_copy = 
     (HittableRef *)mem_arena_push(&copy_arena, list->count * sizeof(HittableRef));
-  memcpy(hittables_copy, list->data, copy_arena.size);
-  hittable_list_split_merge(hittables, list->data, hittables_copy, start, end, type);
+  memcpy(list_data_copy, list->data, copy_arena.size);
+  hittable_list_split_merge(hittables, list->data, list_data_copy, start, end - 1, type);
   mem_arena_free(&copy_arena);
 }
 
-Hittable make_hittable_translation(HittableList *world, u64 hittable_idx, vec3 offset) {
+Hittable make_hittable_translation(HittableList *world, HittableRef hittable_idx, vec3 offset) {
   Hittable result = { VIS_OBJECT_TRANSLATION };
   result.translation.idx = hittable_idx;
   result.translation.offset = offset;
   result.translation.bounding_box = 
-    aabb_add_offset(hittable_get_bounding_box(&world->objects[hittable_idx]), offset);
+    aabb_add_offset(*hittable_get_bounding_box(&world->objects[hittable_idx]), offset);
   return result;
 }
 
-Hittable make_hittable_y_rotation(HittableList *world, u64 hittable_idx, f32 angle) {
+Hittable make_hittable_y_rotation(HittableList *world, HittableRef hittable_idx, f32 angle) {
   Hittable result = { VIS_OBJECT_Y_ROTATION };
   result.y_rotation.idx = hittable_idx;
   f32 radians = degrees_to_radians(angle);
@@ -801,7 +829,7 @@ void hittable_list_set(HittableList *list, u64 idx, Hittable hittable) {
   }
 }
 
-u64 make_bvh_node_from_hittable_list_bound(HittableList *hittables, HittableRefList *world,
+WorldRef make_bvh_node_from_hittable_list_bound(HittableList *hittables, HittableRefList *world,
     u64 world_start, u64 world_end) {
   Hittable curr_node = {0};
   curr_node.type = VIS_OBJECT_BVH_NODE;
@@ -816,12 +844,13 @@ u64 make_bvh_node_from_hittable_list_bound(HittableList *hittables, HittableRefL
     node->right = world_start + 1;
   } else {
     HITTABLE_LIST_COMP_TYPE comp_type = random_i32_bound(0, 2);
-    hittable_list_sort_bound(hittables, world, world_start, world_end, comp_type);
+    // TODO: investigate, cornell box is slower with this
+    //hittable_list_sort_bound(hittables, world, world_start, world_end, comp_type);
 #if 0
-    for (u64 i = world_start; i <world_end - 1; ++i) {
+    for (u64 i = world_start; i < world_end - 1; ++i) {
       b32 comp = 0;
-      Aabb *debug_bbox1 = hittable_get_bounding_box(&list->objects[i]);
-      Aabb *debug_bbox2 = hittable_get_bounding_box(&list->objects[i + 1]);
+      Aabb *debug_bbox1 = hittable_get_bounding_box(&hittables->objects[world->data[i]]);
+      Aabb *debug_bbox2 = hittable_get_bounding_box(&hittables->objects[world->data[i + 1]]);
       switch (comp_type) {
         case HITTABLE_LIST_COMP_TYPE_X_AXIS:
           comp = debug_bbox1->x0 <= debug_bbox2->x0;
@@ -843,15 +872,17 @@ u64 make_bvh_node_from_hittable_list_bound(HittableList *hittables, HittableRefL
     node->right = make_bvh_node_from_hittable_list_bound(hittables, world, mid, world_end);
   }
 
-  Aabb *left_bbox = hittable_get_bounding_box(&hittables->objects[node->left]);
-  Aabb *right_bbox = hittable_get_bounding_box(&hittables->objects[node->right]);
+  Aabb *left_bbox =
+    hittable_get_bounding_box(&hittables->objects[wref_to_href(world, node->left)]);
+  Aabb *right_bbox =
+    hittable_get_bounding_box(&hittables->objects[wref_to_href(world, node->right)]);
   node->bounding_box = aabb_merge(left_bbox, right_bbox);
-  HittableRef result = hittable_list_add(hittables, curr_node);
+  WorldRef result = hittable_ref_list_add(world, hittable_list_add(hittables, curr_node));
   return result;
 }
 
-HittableRef make_bvh_node_from_hittable_list(HittableList *hittables, HittableRefList *world) {
-  HittableRef result =
+WorldRef make_bvh_node_from_hittable_list(HittableList *hittables, HittableRefList *world) {
+  WorldRef result =
     make_bvh_node_from_hittable_list_bound(hittables, world, 0, world->count);
   return result;
 }
@@ -932,30 +963,25 @@ inline b32 aabb_hit(Aabb *bbox, Ray *ray, f32 ray_t0, f32 ray_t1) {
 }
 
 __host__ __device__
-inline b32 hittable_list_hit(GpuData *gd, HittableList *list, Ray *ray,
+inline b32 hittable_structure_hit(PerPixelGpuData *gd, SceneData *sd, HittableStructure *structure, Ray *ray,
     double ray_tmin, double ray_tmax, HitRecord *record);
 
 __host__ __device__
-inline b32 hittable_structure_hit(GpuData *gd, HittableList *list, HittableStructure *structure, Ray *ray,
-    double ray_tmin, double ray_tmax, HitRecord *record);
-
-__host__ __device__
-inline b32 hittable_ref_stack_is_empty(HittableRefStack *stack) {
+inline b32 href_stack_is_empty(HittableRefStack *stack) {
   return stack->count == 0;
 }
 
 __host__ __device__
-inline b32 hittable_ref_stack_push(HittableRefStack *stack, HittableRef ref) {
+inline b32 href_stack_push(HittableRefStack *stack, HittableRef ref) {
   b32 result = 0;
-  if (stack->count != stack->max_count) {
-    stack->data[stack->count++] = ref;
-    result = 1;
-  }
+  assert(stack->count != stack->max_count);
+  stack->data[stack->count++] = ref;
+  result = 1;
   return result;
 }
 
 __host__ __device__
-inline HittableRef hittable_ref_stack_pop(HittableRefStack *stack) {
+inline HittableRef href_stack_pop(HittableRefStack *stack) {
   HittableRef result = 0;
   if (stack->count > 0) {
     stack->count--;
@@ -964,14 +990,19 @@ inline HittableRef hittable_ref_stack_pop(HittableRefStack *stack) {
   return result;
 }
 
+__host__ __device__ inline
+Hittable href_list_get(HittableRefList *refs, HittableList *hittables, HittableRef ref) {
+  return hittables->objects[refs->data[ref]];
+}
+
 __host__ __device__
-inline b32 hit(GpuData *gd, HittableList *hittables, u64 idx,
+inline b32 hit(PerPixelGpuData *gd, SceneData *sd, HittableRef idx,
     f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *record) {
   b32 result = 0;
-  HittableRefStack *stack = gd->hit_stack;
-  hittable_ref_stack_push(stack, idx);
-  while (!hittable_ref_stack_is_empty(stack)) {
-    Hittable *hittable = &hittables->objects[hittable_ref_stack_pop(stack)];
+  HittableRefStack *stack = &gd->hit_stack;
+  href_stack_push(stack, idx);
+  while (!href_stack_is_empty(stack)) {
+    Hittable *hittable = &sd->hittables.objects[href_stack_pop(stack)];
     switch (hittable->type) {
       case VIS_OBJECT_SPHERE: {
         printf("-");
@@ -998,6 +1029,7 @@ inline b32 hit(GpuData *gd, HittableList *hittables, u64 idx,
             sphere_get_uv(&outward_normal, &record->u, &record->v);
             hit_record_set_face_normal(record, ray, outward_normal);
 
+            ray_tmax = record->t;
             result = 1;
           }
         }
@@ -1005,12 +1037,9 @@ inline b32 hit(GpuData *gd, HittableList *hittables, u64 idx,
       case VIS_OBJECT_BVH_NODE: {
         BvhNode *node = &hittable->bvh_node;
         if (aabb_hit(&node->bounding_box, ray, ray_tmin, ray_tmax)) {
-          hittable_ref_stack_push(stack, node->right);
-          hittable_ref_stack_push(stack, node->left);
+          href_stack_push(stack, wref_to_href(&sd->world, node->right));
+          href_stack_push(stack, wref_to_href(&sd->world, node->left));
         }
-      } break;
-      case VIS_OBJECT_HITTABLE_LIST: { //TODO: not used anymore I think
-        result = result || hittable_list_hit(gd, &hittable->hlist, ray, ray_tmin, ray_tmax, record);
       } break;
       case VIS_OBJECT_QUAD: {
         Quad *quad = &hittable->quad;
@@ -1029,24 +1058,25 @@ inline b32 hit(GpuData *gd, HittableList *hittables, u64 idx,
               record->point_hit = intersection;
               record->mat = quad->mat;
               hit_record_set_face_normal(record, ray, quad->normal);
+
+              ray_tmax = record->t;
               result = 1;
             }
           }
         }
       } break;
       case VIS_OBJECT_TRANSLATION: {
-        printf("(");
         Translation *translation = &hittable->translation;
         Ray offset_ray = { vec3_sub(ray->origin, translation->offset),
           ray->direction,
           ray->intersection_time };
-        if (hit(gd, hittables, translation->idx, ray_tmin, ray_tmax, &offset_ray, record)) {
+        if (hit(gd, sd, translation->idx, ray_tmin, ray_tmax, &offset_ray, record)) {
           vec3_inplace_add(&record->point_hit, translation->offset);
+          ray_tmax = record->t;
           result = 1;
         }
       } break;
       case VIS_OBJECT_Y_ROTATION: {
-        printf(")");
         YRotation *y_rot = &hittable->y_rotation;
         vec3 rotated_origin = Vec3(
             (y_rot->cos_theta * ray->origin.x) - (y_rot->sin_theta * ray->origin.z),
@@ -1062,7 +1092,7 @@ inline b32 hit(GpuData *gd, HittableList *hittables, u64 idx,
 
         Ray rotated_ray = { rotated_origin, rotated_direction, ray->intersection_time };
 
-        if (hit(gd, hittables, y_rot->idx, ray_tmin, ray_tmax, &rotated_ray, record)) {
+        if (hit(gd, sd, y_rot->idx, ray_tmin, ray_tmax, &rotated_ray, record)) {
           record->point_hit = Vec3(
               (y_rot->cos_theta * record->point_hit.x) + (y_rot->sin_theta * record->point_hit.z),
               record->point_hit.y,
@@ -1074,17 +1104,22 @@ inline b32 hit(GpuData *gd, HittableList *hittables, u64 idx,
               record->normal.y,
               (-y_rot->sin_theta * record->normal.x) + (y_rot->cos_theta * record->normal.z)
           );
+          
+          ray_tmax = record->t;
           result = 1;
         }
       } break;
       case VIS_OBJECT_HITTABLE_STRUCTURE: {
-        printf("+");
-        result = hittable_structure_hit(gd, hittables, &hittable->hstructure, ray, ray_tmin, ray_tmax, record);
+#if 0
+        result = hittable_structure_hit(gd, sd, &hittable->hstructure, ray, ray_tmin, ray_tmax, record);
+#else
+        HittableStructure *structure = &hittable->hstructure;
+        for (HittableRef i = 0; i < structure->count; ++i) {
+          href_stack_push(stack, structure->idx + i);
+        }
+#endif
       } break;
     }
-
-    if (result == 1)
-      ray_tmax = record->t;
   }
   return result;
 }
@@ -1293,23 +1328,24 @@ inline void ray_color_stack_pop(RayColorStack *stack, vec3 *attenuation, vec3 *e
 }
 
 __device__
-vec3 ray_color(SceneData *sd, GpuData *gd, curandState *rng, Ray *ray,
+vec3 ray_color(SceneData *sd, PerPixelGpuData *gd, curandState *rng, Ray *ray,
     vec3 background_color) {
-  i32 max_bounces = gd->rc_stack->max_count;
+  i32 max_bounces = gd->rc_stack.max_count;
   vec3 result = {0};
   HitRecord record = {0};
   Ray bounce = *ray;
   while (max_bounces > 0) {
-    if (hit(gd, sd->hittables, sd->root_bvh_node, 0.001f, inf_f32(), &bounce, &record)) {
+    if (hit(gd, sd, wref_to_href(&sd->world, sd->root_bvh_node),
+          0.001f, inf_f32(), &bounce, &record)) {
       vec3 emission_color =
-        material_emit(sd->textures, &record.mat, record.u, record.v, record.point_hit);
+        material_emit(&sd->textures, &record.mat, record.u, record.v, record.point_hit);
       ScatterRes scatter =
-        cuda_material_scatter(sd->textures, rng, &record.mat, bounce.direction, &record);
+        cuda_material_scatter(&sd->textures, rng, &record.mat, bounce.direction, &record);
       if (scatter.is_hit) {
         bounce.origin = record.point_hit;
         bounce.direction = scatter.direction;
 
-        ray_color_stack_push(gd->rc_stack, scatter.attenuation, emission_color);
+        ray_color_stack_push(&gd->rc_stack, scatter.attenuation, emission_color);
         max_bounces--;
       } else {
         result = emission_color;
@@ -1321,11 +1357,10 @@ vec3 ray_color(SceneData *sd, GpuData *gd, curandState *rng, Ray *ray,
     }
   }
 
-  //printf("K");
-  while (!ray_color_stack_is_empty(gd->rc_stack)) {
+  while (!ray_color_stack_is_empty(&gd->rc_stack)) {
     vec3 attenuation = {0};
     vec3 emission_color = {0};
-    ray_color_stack_pop(gd->rc_stack, &attenuation, &emission_color);
+    ray_color_stack_pop(&gd->rc_stack, &attenuation, &emission_color);
     vec3 scatter_color = vec3_comp_scale(attenuation, result);
     result = vec3_add(scatter_color, emission_color);
   }
@@ -1334,32 +1369,14 @@ vec3 ray_color(SceneData *sd, GpuData *gd, curandState *rng, Ray *ray,
 }
 
 __host__ __device__
-inline b32 hittable_list_hit(GpuData *gd, HittableList *list, Ray *ray,
+inline b32 hittable_structure_hit(PerPixelGpuData *gd, SceneData *sd, HittableStructure *structure, Ray *ray,
     double ray_tmin, double ray_tmax, HitRecord *record) {
   HitRecord temp_record;
   b32 hit_anything = 0;
   float closest_so_far = ray_tmax;
 
-  for (u64 i = 0; i < list->count; ++i) {
-    if (hit(gd, list, i, ray_tmin, closest_so_far, ray, &temp_record)) {
-      hit_anything = 1;
-      closest_so_far = temp_record.t;
-      *record = temp_record;
-    }
-  }
-
-  return hit_anything;
-}
-
-__host__ __device__
-inline b32 hittable_structure_hit(GpuData *gd, HittableList *list, HittableStructure *structure, Ray *ray,
-    double ray_tmin, double ray_tmax, HitRecord *record) {
-  HitRecord temp_record;
-  b32 hit_anything = 0;
-  float closest_so_far = ray_tmax;
-
-  for (int i = structure->idx; i < structure->count; ++i) {
-    if (hit(gd, list, i, ray_tmin, closest_so_far, ray, &temp_record)) {
+  for (u32 i = structure->idx; i < structure->count; ++i) {
+    if (hit(gd, sd, i, ray_tmin, closest_so_far, ray, &temp_record)) {
       hit_anything = 1;
       closest_so_far = temp_record.t;
       *record = temp_record;
@@ -1414,34 +1431,6 @@ void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
   }
 
   fclose(img_file);
-}
-
-f32 hit_sphere(vec3 sphere_loc, float radius, vec3 ray_origin, vec3 ray_direction) {
-  vec3 oc = vec3_sub(sphere_loc, ray_origin);
-  float a = vec3_dot_prod(ray_direction, ray_direction);
-  float b = -2.0f * vec3_dot_prod(ray_direction, oc);
-  float c = vec3_dot_prod(oc, oc) - radius * radius;
-  float discriminant = b * b - 4*a*c;
-
-  if (discriminant < 0)
-    return -1.0f;
-  else
-    return (-b - sqrtf(discriminant)) / (2.0f*a);
-}
-
-f32 hit_sphere_slower_simplified(vec3 sphere_loc, float radius, vec3 ray_origin, vec3 ray_direction) {
-  vec3 oc = vec3_sub(sphere_loc, ray_origin);
-  float direction_len = vec3_length(ray_direction);
-  float a = direction_len * direction_len;
-  float h = vec3_dot_prod(ray_direction, oc);
-  float oc_len = vec3_length(oc);
-  float c = oc_len * oc_len - radius * radius;
-  float discriminant = h*h - a * c;
-
-  if (discriminant < 0)
-    return -1.0f;
-  else
-    return (h - sqrtf(discriminant)) / a;
 }
 
 #define ZERO_VEC Vec3(0.0f, 0.0f, 0.0f)
@@ -1580,8 +1569,8 @@ cuda_defocus_disk_sample(curandState *rng, vec3 center, vec3 defocus_disk_u, vec
       center, vec3_add(vec3_scale(p.x, defocus_disk_u), vec3_scale(p.y, defocus_disk_v)));
 }
 
-void print_bvh_info(Hittable *nodes, u64 idx) {
-  Hittable *node = &nodes[idx];
+void print_bvh_info(Hittable *nodes, HittableRef *refs, WorldRef idx) {
+  Hittable *node = &nodes[refs[idx]];
   Aabb *bbox = hittable_get_bounding_box(node);
   printf("===\n%f\n%f\n%f\n%f\n%f\n%f\n", bbox->x0, bbox->x1, bbox->y0, bbox->y1, bbox->z0, bbox->z1);
   switch (node->type) {
@@ -1590,8 +1579,8 @@ void print_bvh_info(Hittable *nodes, u64 idx) {
     } break;
     case VIS_OBJECT_BVH_NODE: {
       printf("===bvh_node\n");
-      print_bvh_info(nodes, node->bvh_node.left);
-      print_bvh_info(nodes, node->bvh_node.right);
+      print_bvh_info(nodes, refs, node->bvh_node.left);
+      print_bvh_info(nodes, refs, node->bvh_node.right);
     } break;
     case VIS_OBJECT_HITTABLE_LIST: {
       printf("===hlist\n");
@@ -1639,7 +1628,7 @@ static RenderSettings g_default_render_settings =
 } while (0)
 
 __global__
-void cuda_calc(SceneData sd, GpuData gd, vec3 *pixels_colors, i32 img_width, i32 n, 
+void cuda_calc(SceneData *sd, PerPixelGpuData *gd, vec3 *pixels_colors, i32 img_width, i32 n, 
     RenderSettings settings, vec3 pixel_delta_v, vec3 pixel_delta_u, vec3 camera_pos,
     vec3 defocus_disk_u, vec3 defocus_disk_v, f32 pixel_samples_scale,
     vec3 current_pixel_center, curandState *rng) {
@@ -1668,8 +1657,8 @@ void cuda_calc(SceneData sd, GpuData gd, vec3 *pixels_colors, i32 img_width, i32
       sampling_ray.intersection_time = curand_uniform(&local_rng);
 
       vec3_inplace_add(&pixels_colors[curr_idx],
-          ray_color(&sd,
-            &gd,
+          ray_color(sd,
+            &gd[idx],
             &local_rng,
             &sampling_ray, 
             settings.background_color));
@@ -1681,7 +1670,7 @@ void cuda_calc(SceneData sd, GpuData gd, vec3 *pixels_colors, i32 img_width, i32
 
 __global__
 void init_rng(curandState* rng, unsigned int seed, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    u64 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i == 0) printf("Entered init rng\n");
     if (i == n) printf("Finished init_rng\n");
     if (i >= n) return;
@@ -1689,11 +1678,38 @@ void init_rng(curandState* rng, unsigned int seed, int n) {
     curand_init(seed, i, 0, &rng[i]);
 }
 
+#define PTR_TO_INT(p) (u64)((u8*)p - (u8*)0)
+#define INT_TO_PTR(n) (u8*)((u8*)0 + (n))
+
+//NOTE: alignment must be a power of 2
+__device__ __host__
+inline u64 align_up(u64 p, u64 alignment) {
+  return (p + alignment - 1) & ~(alignment - 1);
+}
+
+__device__ __host__
+inline u8 *align_ptr_up(u8 *p, u64 alignment) {
+  return INT_TO_PTR(align_up(PTR_TO_INT(p), alignment));
+}
+
+__global__
+void init_gpu_data(PerPixelGpuData *gd, RayColorStackData *rcsd, WorldRef *hrs, 
+    i32 max_bounces, u32 max_bvh_depth) {
+    u64 i = blockIdx.x * blockDim.x + threadIdx.x;
+    gd[i].rc_stack.max_count = max_bounces;
+    gd[i].rc_stack.count = 0;
+    gd[i].rc_stack.data = &rcsd[i * max_bounces];
+
+    gd[i].hit_stack.max_count = max_bvh_depth;
+    gd[i].hit_stack.count = 0;
+    gd[i].hit_stack.data = &hrs[i * max_bvh_depth];
+}
+
 void render_w_settings(HittableList *hittables, TextureList *textures,
     HittableRefList *world, RenderSettings *settings) {
-  HittableRef root_bvh_node = make_bvh_node_from_hittable_list(hittables, world);
+  WorldRef root_bvh_node = make_bvh_node_from_hittable_list(hittables, world);
 
-  print_bvh_info(hittables->objects, root_bvh_node);
+  print_bvh_info(hittables->objects, world->data, root_bvh_node);
 
   f32 pixel_samples_scale = 1.0f / (f32)settings->samples_per_pixel;
 
@@ -1742,57 +1758,57 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   cudaMalloc(&gpu_hittable_data, hittable_data_size);
   cudaMemcpy(gpu_hittable_data, hittables->objects, hittable_data_size, cudaMemcpyHostToDevice);
 
-  HittableList *gpu_hittables;
-  cudaMalloc(&gpu_hittables, sizeof(HittableList));
-  HittableList hittables_copy = *hittables;
-  hittables_copy.objects = gpu_hittable_data;
-  cudaMemcpy(gpu_hittables, &hittables_copy, sizeof(HittableList), cudaMemcpyHostToDevice);
+  HittableList gpu_hittables = *hittables;
+  gpu_hittables.objects = gpu_hittable_data;
 
   Texture *gpu_texture_data;
   u64 texture_data_size = textures->count * sizeof(Texture);
   cudaMalloc(&gpu_texture_data, texture_data_size);
   cudaMemcpy(gpu_texture_data, textures->data, texture_data_size, cudaMemcpyHostToDevice);
 
-  TextureList *gpu_textures;
-  cudaMalloc(&gpu_textures, sizeof(TextureList));
-  TextureList textures_copy = *textures;
-  textures_copy.data = gpu_texture_data;
-  cudaMemcpy(gpu_textures, &textures_copy, sizeof(textures_copy), cudaMemcpyHostToDevice);
-  cudaError_t err = cudaGetLastError();
-  printf("cuda malloc error: %s\n", cudaGetErrorString(err));
+  TextureList gpu_textures = *textures;
+  gpu_textures.data = gpu_texture_data;
+
+  HittableRef *gpu_hittable_refs;
+  u64 hittable_refs_size = world->count * sizeof(HittableRef);
+  cudaMalloc(&gpu_hittable_refs, hittable_refs_size);
+  cudaMemcpy(gpu_hittable_refs, world->data, hittable_refs_size, cudaMemcpyHostToDevice);
+
+  HittableRefList gpu_world = *world;
+  gpu_world.data = gpu_hittable_refs;
+
+  i32 block_size = 256;
+  i32 num_blocks = (n + block_size - 1) / block_size;
 
   SceneData sd = {0};
   sd.hittables = gpu_hittables;
   sd.textures = gpu_textures;
+  sd.world = gpu_world;
   sd.root_bvh_node = root_bvh_node;
 
-  RayColorStackData *rc_stack_data;
-  cudaMalloc(&rc_stack_data, sizeof(RayColorStackData) * settings->max_bounces);
-  RayColorStack rc_stack = {0};
-  rc_stack.data = rc_stack_data;
-  rc_stack.max_count = settings->max_bounces;
-  RayColorStack *gpu_rc_stack;
-  cudaMalloc(&gpu_rc_stack, sizeof(RayColorStack));
-  cudaMemcpy(gpu_rc_stack, &rc_stack, sizeof(RayColorStack), cudaMemcpyHostToDevice);
+  SceneData *gpu_sd;
+  cudaMalloc(&gpu_sd, sizeof(SceneData));
+  cudaMemcpy(gpu_sd, &sd, sizeof(SceneData), cudaMemcpyHostToDevice);
 
-  HittableRef *hit_stack_data;
-  //NOTE: probably doesn't need this much memory
-  cudaMalloc(&hit_stack_data, sizeof(HittableRef) * hittables->count);
-  HittableRefStack hit_stack = {0};
-  hit_stack.data = hit_stack_data;
-  hit_stack.max_count = hittables->count;
-  HittableRefStack *gpu_hit_stack;
-  cudaMalloc(&gpu_hit_stack, sizeof(HittableRefStack));
-  cudaMemcpy(gpu_hit_stack, &hit_stack, sizeof(HittableRefStack), cudaMemcpyHostToDevice);
+  u64 max_bvh_depth = logf(world->count) / logf(2.0f) + 1;
+  // NOTE: take into account y_rotation, translation and hittable_structure hit calls
+  max_bvh_depth += 10;
 
-  GpuData gd = {0};
-  gd.rc_stack = gpu_rc_stack;
-  gd.hit_stack = gpu_hit_stack;
+  PerPixelGpuData *gd;
+  cudaMalloc(&gd, n * sizeof(PerPixelGpuData));
+  RayColorStackData *rc_stacks_data;
+  cudaMalloc(&rc_stacks_data, n * sizeof(RayColorStackData) * settings->max_bounces);
+  WorldRef *hit_stacks_data;
+  cudaMalloc(&hit_stacks_data, n * sizeof(WorldRef) * max_bvh_depth);
+
+  init_gpu_data<<<num_blocks, block_size>>>(gd, rc_stacks_data, hit_stacks_data,
+      settings->max_bounces, max_bvh_depth);
+  cudaDeviceSynchronize();
+
+  cudaError_t err;
 
   f64 time_start = timer_start_ms();
   f64 time_start_s = timer_start();
-  i32 block_size = 256;
-  i32 num_blocks = (n + block_size - 1) / block_size;
   curandState *d_rng;
   cudaMalloc(&d_rng, n*sizeof(curandState));
   err = cudaGetLastError();
@@ -1803,8 +1819,7 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   cudaDeviceSynchronize();
   err = cudaGetLastError();
   printf("init_rng sync error: %s\n", cudaGetErrorString(err));
-  printf("n/64=%lld\n", n/64);
-  cuda_calc<<<num_blocks, block_size>>>(sd, gd, pixels_colors, img_width, n, *settings,
+  cuda_calc<<<num_blocks, block_size>>>(gpu_sd, gd, pixels_colors, img_width, n, *settings,
       pixel_delta_v, pixel_delta_u, camera_pos, defocus_disk_u, defocus_disk_v,
       pixel_samples_scale, current_pixel_center, d_rng);
   //CUDA_CHECK(cudaDeviceSynchronize());
@@ -2113,26 +2128,38 @@ void cornell_box_scene() {
         hittable_list_add(&hittables, 
           make_hittable_quad(Vec3(0,0,555), Vec3(555,0,0), Vec3(0,555,0), white)));
 
-  Hittable box1 = make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 330, 165), white);
-  u64 box1_idx = hittable_list_add(&hittables, box1);
-  Hittable box1t = make_hittable_y_rotation(&hittables, box1_idx, 15);
-  u64 box1t_idx = hittable_list_add(&hittables, box1t);
-  Hittable box1tr = make_hittable_translation(&hittables, box1t_idx, Vec3(265, 0, 295));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, box1tr));
+#if 1
+  HittableRef box1 = hittable_list_add(&hittables,
+      make_box(&hittables, Vec3(130, 0, 65), Vec3(295, 165, 230), white));
+  box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
+  hittable_ref_list_add(&world, box1);
+#else
+  HittableRef box1 = hittable_list_add(&hittables,
+      make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 330, 165), white));
+  //box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
+  box1 = hittable_list_add(&hittables,
+      make_hittable_translation(&hittables, box1, Vec3(265, 0, 295)));
+  hittable_ref_list_add(&world, box1);
+#endif
 
-  Hittable box2 = make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 165, 165), white);
-  u64 box2_idx = hittable_list_add(&hittables, box2);
-  Hittable box2t = make_hittable_y_rotation(&hittables, box2_idx, -18);
-  u64 box2t_idx = hittable_list_add(&hittables, box2t);
-  Hittable box2tr = make_hittable_translation(&hittables, box2t_idx, Vec3(130, 0, 65));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, box2tr));
+#if 1
+  HittableRef box2 = hittable_list_add(&hittables,
+      make_box(&hittables, Vec3(265, 0, 295), Vec3(430, 330, 460), white));
+  box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
+  hittable_ref_list_add(&world, box2);
+#else
+  HittableRef box2 = hittable_list_add(&hittables,
+      make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 165, 165), white));
+  //box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
+  box2 = hittable_list_add(&hittables,
+      make_hittable_translation(&hittables, box2, Vec3(130, 0, 65)));
+  hittable_ref_list_add(&world, box2);
+#endif
 
   RenderSettings settings = {0};
   settings.img_ratio = 1.0f;
   settings.img_width = 600;
-  settings.samples_per_pixel = 2000;
+  settings.samples_per_pixel = 200;
   settings.max_bounces = 50;
   settings.vfov = 40;
   settings.lookfrom = Vec3(278, 278, -800);
