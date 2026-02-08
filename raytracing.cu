@@ -397,9 +397,9 @@ inline vec3 texture_get_color(TextureList *textures, TextureRef tex, f32 u, f32 
     } break;
     case TEXTURE_CHECKER: {
       Checker *checker = &texture->checker;
-      u32 x = (u32)floorf(checker->inverted_scale * point.x);
-      u32 y = (u32)floorf(checker->inverted_scale * point.y);
-      u32 z = (u32)floorf(checker->inverted_scale * point.z);
+      i32 x = (i32)floorf(checker->inverted_scale * point.x);
+      i32 y = (i32)floorf(checker->inverted_scale * point.y);
+      i32 z = (i32)floorf(checker->inverted_scale * point.z);
       
       b32 is_even = (x + y + z) % 2 == 0;
 
@@ -1990,7 +1990,6 @@ void checkered_spheres_scene() {
   render_w_settings(&hittables, &textures, &world, &settings);
 }
 
-/*
 void earth_scene() {
   MemArena texture_arena = {0};
   mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
@@ -2042,6 +2041,7 @@ void perlin_spheres_scene() {
   render_w_settings(&world, &settings);
 }
 
+/*
 void quads_scene() {
   MemArena texture_arena = {0};
   mem_arena_alloc(&texture_arena, sizeof(Texture) * 10);
@@ -2193,7 +2193,7 @@ void cornell_box_scene() {
   RenderSettings settings = {0};
   settings.img_ratio = 1.0f;
   settings.img_width = 600;
-  settings.samples_per_pixel = 200;
+  settings.samples_per_pixel = 1000;
   settings.max_bounces = 50;
   settings.vfov = 40;
   settings.lookfrom = Vec3(278, 278, -800);
@@ -2208,10 +2208,10 @@ i32 main() {
   // vec3_to_unit_vec_test();
 
   //bouncing_spheres_scene();
-  //checkered_spheres_scene();
+  checkered_spheres_scene();
   // earth_scene();
   // perlin_spheres_scene();
   // quads_scene();
   // simple_light_scene();
-  cornell_box_scene();
+  //cornell_box_scene();
 }
