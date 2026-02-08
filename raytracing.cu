@@ -16,7 +16,7 @@
 // unity build
 #include "perlin_noise.c"
 
-#define WORLD_SIZE 500
+#define WORLD_SIZE 1000
 
 typedef struct {
   u8 *data;
@@ -999,13 +999,17 @@ __host__ __device__
 inline b32 hit(PerPixelGpuData *gd, SceneData *sd, HittableRef idx,
     f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *record) {
   b32 result = 0;
+  b32 was_last_hit = 0;
+  i32 translation_cleanup_counter = 0;
+  i32 yrot_cleanup_counter = 0;
+  HittableRef curr_idx = 0;
   HittableRefStack *stack = &gd->hit_stack;
   href_stack_push(stack, idx);
   while (!href_stack_is_empty(stack)) {
-    Hittable *hittable = &sd->hittables.objects[href_stack_pop(stack)];
+    curr_idx = href_stack_pop(stack);
+    Hittable *hittable = &sd->hittables.objects[curr_idx];
     switch (hittable->type) {
       case VIS_OBJECT_SPHERE: {
-        printf("-");
         vec3 current_sphere_position = 
           movement_path_at(&hittable->sphere.movement_path, ray->intersection_time);
         vec3 oc = vec3_sub(current_sphere_position, ray->origin);
@@ -1031,7 +1035,9 @@ inline b32 hit(PerPixelGpuData *gd, SceneData *sd, HittableRef idx,
 
             ray_tmax = record->t;
             result = 1;
-          }
+            if (translation_cleanup_counter || yrot_cleanup_counter)
+              was_last_hit = 1;
+          } 
         }
       } break;
       case VIS_OBJECT_BVH_NODE: {
@@ -1061,52 +1067,72 @@ inline b32 hit(PerPixelGpuData *gd, SceneData *sd, HittableRef idx,
 
               ray_tmax = record->t;
               result = 1;
+              if (translation_cleanup_counter || yrot_cleanup_counter)
+                was_last_hit = 1;
             }
           }
         }
       } break;
       case VIS_OBJECT_TRANSLATION: {
         Translation *translation = &hittable->translation;
-        Ray offset_ray = { vec3_sub(ray->origin, translation->offset),
-          ray->direction,
-          ray->intersection_time };
-        if (hit(gd, sd, translation->idx, ray_tmin, ray_tmax, &offset_ray, record)) {
-          vec3_inplace_add(&record->point_hit, translation->offset);
-          ray_tmax = record->t;
-          result = 1;
+        if (translation_cleanup_counter == 0) {
+          was_last_hit = 0;
+          vec3_inplace_sub(&ray->origin, translation->offset);
+          href_stack_push(stack, curr_idx);
+          href_stack_push(stack, translation->idx);
+          translation_cleanup_counter++;
+        } else {
+          vec3_inplace_add(&ray->origin, translation->offset);
+          translation_cleanup_counter--;
+          if (was_last_hit) {
+            vec3_inplace_add(&record->point_hit, translation->offset);
+          }
         }
       } break;
       case VIS_OBJECT_Y_ROTATION: {
         YRotation *y_rot = &hittable->y_rotation;
-        vec3 rotated_origin = Vec3(
-            (y_rot->cos_theta * ray->origin.x) - (y_rot->sin_theta * ray->origin.z),
-            ray->origin.y,
-            (y_rot->sin_theta * ray->origin.x) + (y_rot->cos_theta * ray->origin.z)
-        );
-
-        vec3 rotated_direction = Vec3(
-            (y_rot->cos_theta * ray->direction.x) - (y_rot->sin_theta * ray->direction.z),
-            ray->direction.y,
-            (y_rot->sin_theta * ray->direction.x) + (y_rot->cos_theta * ray->direction.z)
-        );
-
-        Ray rotated_ray = { rotated_origin, rotated_direction, ray->intersection_time };
-
-        if (hit(gd, sd, y_rot->idx, ray_tmin, ray_tmax, &rotated_ray, record)) {
-          record->point_hit = Vec3(
-              (y_rot->cos_theta * record->point_hit.x) + (y_rot->sin_theta * record->point_hit.z),
-              record->point_hit.y,
-              (-y_rot->sin_theta * record->point_hit.x) + (y_rot->cos_theta * record->point_hit.z)
+        if (yrot_cleanup_counter == 0) {
+          was_last_hit = 0;
+          ray->origin = Vec3(
+              (y_rot->cos_theta * ray->origin.x) - (y_rot->sin_theta * ray->origin.z),
+              ray->origin.y,
+              (y_rot->sin_theta * ray->origin.x) + (y_rot->cos_theta * ray->origin.z)
           );
 
-          record->normal = Vec3(
-              (y_rot->cos_theta * record->normal.x) + (y_rot->sin_theta * record->normal.z),
-              record->normal.y,
-              (-y_rot->sin_theta * record->normal.x) + (y_rot->cos_theta * record->normal.z)
+          ray->direction = Vec3(
+              (y_rot->cos_theta * ray->direction.x) - (y_rot->sin_theta * ray->direction.z),
+              ray->direction.y,
+              (y_rot->sin_theta * ray->direction.x) + (y_rot->cos_theta * ray->direction.z)
           );
-          
-          ray_tmax = record->t;
-          result = 1;
+          href_stack_push(stack, curr_idx);
+          href_stack_push(stack, y_rot->idx);
+          yrot_cleanup_counter++;
+        } else {
+          ray->origin = Vec3(
+              (y_rot->cos_theta * ray->origin.x) + (y_rot->sin_theta * ray->origin.z),
+              ray->origin.y,
+              (-y_rot->sin_theta * ray->origin.x) + (y_rot->cos_theta * ray->origin.z)
+          );
+
+          ray->direction = Vec3(
+              (y_rot->cos_theta * ray->direction.x) + (y_rot->sin_theta * ray->direction.z),
+              ray->direction.y,
+              (-y_rot->sin_theta * ray->direction.x) + (y_rot->cos_theta * ray->direction.z)
+          );
+          yrot_cleanup_counter--;
+          if (was_last_hit) {
+            record->point_hit = Vec3(
+                (y_rot->cos_theta * record->point_hit.x) + (y_rot->sin_theta * record->point_hit.z),
+                record->point_hit.y,
+                (-y_rot->sin_theta * record->point_hit.x) + (y_rot->cos_theta * record->point_hit.z)
+            );
+
+            record->normal = Vec3(
+                (y_rot->cos_theta * record->normal.x) + (y_rot->sin_theta * record->normal.z),
+                record->normal.y,
+                (-y_rot->sin_theta * record->normal.x) + (y_rot->cos_theta * record->normal.z)
+            );
+          }
         }
       } break;
       case VIS_OBJECT_HITTABLE_STRUCTURE: {
@@ -1614,7 +1640,7 @@ typedef struct {
 } RenderSettings;
 
 static RenderSettings g_default_render_settings = 
-  { 16.0f/9.0f, 1200, 10, 50, 20.0f, { 13.0f, 2.0f, 3.0f },
+  { 16.0f/9.0f, 1200, 100, 50, 20.0f, { 13.0f, 2.0f, 3.0f },
     { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f, {0.7f, 0.8f, 1.0f} };
 
 #define CUDA_CHECK(x) do {                         \
@@ -1844,9 +1870,8 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   pixels_to_ppm(cpu_pixels_colors, img_width, img_height);
 }
 
-/*
-void render(HittableList *world, TextureList *textures) {
-  render_w_settings(world, textures, &g_default_render_settings);
+void render(HittableList *hittables, TextureList *textures, HittableRefList *world) {
+  render_w_settings(hittables, textures, world, &g_default_render_settings);
 }
 
 void bouncing_spheres_scene() {
@@ -1854,11 +1879,15 @@ void bouncing_spheres_scene() {
   mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
   TextureList textures = make_texture_list(&texture_arena, WORLD_SIZE);
 
-  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+  MemArena hittable_ref_arena = {0};
+  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
+  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
 
-  HittableList world = {0};
-  world.objects = hittables;
-  world.size = WORLD_SIZE;
+  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList hittables = {0};
+  hittables.objects = hittables_data;
+  hittables.size = WORLD_SIZE;
 
   Material default_mat = 
     make_lambertian(texture_list_add(&textures, make_solid_color_texture(Vec3(0.5f, 0.5f, 0.5f))));
@@ -1872,7 +1901,7 @@ void bouncing_spheres_scene() {
 
   Material material_ground = make_lambertian(checker_texture);
   Hittable ground = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, -1000.0f, 0.0f), 1000.0f, material_ground) };
-  hittable_list_add(&world, ground);
+  hittable_ref_list_add(&world, hittable_list_add(&hittables, ground));
 
   for (i32 a = -11; a < 11; ++a) {
     for (i32 b = -11; b < 11; ++b) {
@@ -1887,7 +1916,7 @@ void bouncing_spheres_scene() {
           vec3 sphere_direction = Vec3(0.0f, random_f32_bound(0.0f, 0.5f), 0.0f);
           Hittable obj = { VIS_OBJECT_SPHERE, 
             make_moving_sphere(center, sphere_direction, 0.2f, current_material) };
-          hittable_list_add(&world, obj);
+          hittable_ref_list_add(&world, hittable_list_add(&hittables, obj));
         } else {
           if (material_choice < 0.95f) {
             vec3 albedo = vec3_random_bound(0.5f, 1.0f);
@@ -1897,7 +1926,7 @@ void bouncing_spheres_scene() {
             current_material = make_dielectric(1.5f);
           }
           Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
-          hittable_list_add(&world, obj);
+          hittable_ref_list_add(&world, hittable_list_add(&hittables, obj));
         }
       }
     }
@@ -1905,17 +1934,17 @@ void bouncing_spheres_scene() {
 
   Material mat1 = make_dielectric(1.5f);
   Hittable big_sphere1 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, 1.0f, 0.0f), 1.0f, mat1) };
-  hittable_list_add(&world, big_sphere1);
+  hittable_ref_list_add(&world, hittable_list_add(&hittables, big_sphere1));
 
   Material mat2 = make_lambertian(texture_list_add(&textures, make_solid_color_texture(Vec3(0.4f, 0.2f, 0.1f))));
   Hittable big_sphere2 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(-4.0f, 1.0f, 0.0f), 1.0f, mat2) };
-  hittable_list_add(&world, big_sphere2);
+  hittable_ref_list_add(&world, hittable_list_add(&hittables, big_sphere2));
 
   Material mat3 = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.0f);
   Hittable big_sphere3 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(4.0f, 1.0f, 0.0f), 1.0f, mat3) };
-  hittable_list_add(&world, big_sphere3);
+  hittable_ref_list_add(&world, hittable_list_add(&hittables, big_sphere3));
 
-  render(&world, &textures);
+  render(&hittables, &textures, &world);
 }
 
 void checkered_spheres_scene() {
@@ -1923,11 +1952,15 @@ void checkered_spheres_scene() {
   mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
   TextureList textures = make_texture_list(&texture_arena, WORLD_SIZE);
 
-  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+  MemArena hittable_ref_arena = {0};
+  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
+  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
 
-  HittableList world = {0};
-  world.objects = hittables;
-  world.size = WORLD_SIZE;
+  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList hittables = {0};
+  hittables.objects = hittables_data;
+  hittables.size = WORLD_SIZE;
 
   TextureRef color_even = texture_list_add(&textures,
       make_solid_color_texture(Color(0.2f, 0.3f, 0.1f)));
@@ -1939,8 +1972,8 @@ void checkered_spheres_scene() {
   Hittable sphere1 = make_hittable_sphere(Vec3(0.0f, -10.0f, 0.0f), 10.0f, make_lambertian(checker_texture));
   Hittable sphere2 = make_hittable_sphere(Vec3(0.0f, 10.0f, 0.0f), 10.0f, make_lambertian(checker_texture));
 
-  hittable_list_add(&world, sphere1);
-  hittable_list_add(&world, sphere2);
+  hittable_ref_list_add(&world, hittable_list_add(&hittables, sphere1));
+  hittable_ref_list_add(&world, hittable_list_add(&hittables, sphere2));
 
   RenderSettings settings = {0};
   settings.img_ratio = 16.0f / 9.0f;
@@ -1954,9 +1987,10 @@ void checkered_spheres_scene() {
   settings.defocus_angle = 0.0f;
   settings.background_color = Vec3(0.7f, 0.8f, 1.0f);
 
-  render_w_settings(&world, &textures, &settings);
+  render_w_settings(&hittables, &textures, &world, &settings);
 }
 
+/*
 void earth_scene() {
   MemArena texture_arena = {0};
   mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
@@ -2128,29 +2162,29 @@ void cornell_box_scene() {
         hittable_list_add(&hittables, 
           make_hittable_quad(Vec3(0,0,555), Vec3(555,0,0), Vec3(0,555,0), white)));
 
-#if 1
+#if 0
   HittableRef box1 = hittable_list_add(&hittables,
       make_box(&hittables, Vec3(130, 0, 65), Vec3(295, 165, 230), white));
-  box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
+  //box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
   hittable_ref_list_add(&world, box1);
 #else
   HittableRef box1 = hittable_list_add(&hittables,
       make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 330, 165), white));
-  //box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
+  box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
   box1 = hittable_list_add(&hittables,
       make_hittable_translation(&hittables, box1, Vec3(265, 0, 295)));
   hittable_ref_list_add(&world, box1);
 #endif
 
-#if 1
+#if 0
   HittableRef box2 = hittable_list_add(&hittables,
       make_box(&hittables, Vec3(265, 0, 295), Vec3(430, 330, 460), white));
-  box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
+  //box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
   hittable_ref_list_add(&world, box2);
 #else
   HittableRef box2 = hittable_list_add(&hittables,
       make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 165, 165), white));
-  //box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
+  box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
   box2 = hittable_list_add(&hittables,
       make_hittable_translation(&hittables, box2, Vec3(130, 0, 65)));
   hittable_ref_list_add(&world, box2);
@@ -2173,8 +2207,8 @@ void cornell_box_scene() {
 i32 main() {
   // vec3_to_unit_vec_test();
 
-  // bouncing_spheres_scene();
-  // checkered_spheres_scene();
+  //bouncing_spheres_scene();
+  //checkered_spheres_scene();
   // earth_scene();
   // perlin_spheres_scene();
   // quads_scene();
