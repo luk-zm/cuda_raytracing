@@ -18,6 +18,20 @@
 
 #define WORLD_SIZE 1000
 
+#define PTR_TO_INT(p) (u64)((u8*)p - (u8*)0)
+#define INT_TO_PTR(n) (u8*)((u8*)0 + (n))
+
+//NOTE: alignment must be a power of 2
+__device__ __host__
+inline u64 align_up(u64 p, u64 alignment) {
+  return (p + alignment - 1) & ~(alignment - 1);
+}
+
+__device__ __host__
+inline u8 *align_ptr_up(u8 *p, u64 alignment) {
+  return INT_TO_PTR(align_up(PTR_TO_INT(p), alignment));
+}
+
 typedef struct {
   u8 *data;
   u64 current_pos;
@@ -36,6 +50,7 @@ void *mem_arena_push(MemArena *arena, u64 size) {
     result = arena->data + arena->current_pos;
     arena->current_pos += size;
   }
+  //arena->current_pos = align_up(arena->current_pos, 256);
   return (void *)result;
 }
 
@@ -89,12 +104,14 @@ typedef struct {
 
 typedef struct {
   vec3 *pixels;
+  u64 loaded_pixels_idx;
   i32 width;
   i32 height;
 } ImageTexture;
 
 typedef struct {
   PerlinNoise *noise;
+  u64 perlin_noise_idx;
   f32 scale;
 } NoiseTexture;
 
@@ -117,8 +134,7 @@ struct Texture {
 };
 
 typedef struct {
-  Texture *data;
-  u64 size;
+  MemArena arena;
   u64 count;
 } TextureList;
 
@@ -314,24 +330,44 @@ u64 hittable_ref_list_add(HittableRefList *list, HittableRef tex) {
 }
 
 TextureRef texture_list_add(TextureList *list, Texture tex) {
-  TextureRef result = { list->count };
-  if (list->count < list->size)
-    list->data[list->count++] = tex;
+  TextureRef result = {0};
+  switch (tex.type) {
+    case TEXTURE_SOLID_COLOR:
+    case TEXTURE_CHECKER: {
+      result.idx = list->arena.current_pos;
+      *((Texture *)mem_arena_push(&list->arena, sizeof(Texture))) = tex;
+    } break;
+    case TEXTURE_IMAGE: {
+      result.idx = list->arena.current_pos;
+      Texture *loaded_texture = (Texture *)mem_arena_push(&list->arena, sizeof(Texture));
+      *loaded_texture = tex;
+      loaded_texture->image_texture.loaded_pixels_idx = list->arena.current_pos;
+      u64 image_size = sizeof(vec3) * tex.image_texture.width * tex.image_texture.height;
+      vec3 *pixels = (vec3 *)mem_arena_push(&list->arena, image_size);
+      memcpy(pixels, tex.image_texture.pixels, image_size);
+    } break;
+    case TEXTURE_NOISE: {
+      result.idx = list->arena.current_pos;
+      Texture *loaded_texture = (Texture *)mem_arena_push(&list->arena, sizeof(Texture));
+      tex.noise_texture.perlin_noise_idx = list->arena.current_pos;
+      *loaded_texture = tex;
+      PerlinNoise *noise = (PerlinNoise *)mem_arena_push(&list->arena, sizeof(PerlinNoise));
+      memcpy(noise, tex.noise_texture.noise, sizeof(PerlinNoise));
+    } break;
+  }
+  list->count++;
   return result;
 }
 
-TextureList make_texture_list(MemArena *arena, u64 size) {
+TextureList make_texture_list(MemArena *arena) {
   TextureList result = {0};
-  result.data = (Texture *)mem_arena_push(arena, sizeof(Texture) * size);
-  if (result.data)
-    result.size = size;
+  result.arena = *arena;
   return result;
 }
 
 __host__ __device__
 inline Texture *texture_list_get(TextureList *list, TextureRef ref) {
-  return &list->data[ref.idx];
-  // return ref.idx < list->count ? &list->data[ref.idx] : NULL;
+  return (Texture *)(&list->arena.data[ref.idx]);
 }
 
 Texture make_noise_texture(PerlinNoise *noise, f32 scale) {
@@ -374,14 +410,14 @@ Texture make_image_texture(const char *file_name) {
 }
 
 __host__ __device__
-inline vec3 image_texture_get_pixel(ImageTexture *img_tex, i32 x, i32 y) {
+inline vec3 image_texture_get_pixel(TextureList *textures, ImageTexture *img_tex, i32 x, i32 y) {
   vec3 result = {0};
   if (img_tex->pixels == NULL) {
     result = Vec3(1, 0, 1);
   } else {
     x = CLAMP(x, 0, img_tex->width);
     y = CLAMP(y, 0, img_tex->height);
-    result = *(img_tex->pixels + y * img_tex->width + x);
+    result = ((vec3 *)&textures->arena.data[img_tex->loaded_pixels_idx])[y * img_tex->width + x];
   }
   return result;
 }
@@ -414,14 +450,14 @@ inline vec3 texture_get_color(TextureList *textures, TextureRef tex, f32 u, f32 
       u = CLAMP(u, 0, 1);
       v = 1.0f - CLAMP(v, 0, 1);
       result =
-        image_texture_get_pixel(img_tex, (i32)(u * img_tex->width), (i32)(v * img_tex->height));
+        image_texture_get_pixel(textures, img_tex, (i32)(u * img_tex->width), (i32)(v * img_tex->height));
     } break;
     case TEXTURE_NOISE: {
       NoiseTexture *noise_tex = &texture->noise_texture;
       result =
         vec3_scale(1 + sinf(
             noise_tex->scale * point.z + 10 * perlin_turbulence(
-                                                noise_tex->noise, 
+                                                (PerlinNoise *)&textures->arena.data[noise_tex->perlin_noise_idx], 
                                                 point,
                                                 7)),
             Color(0.5f, 0.5f, 0.5f));
@@ -767,22 +803,22 @@ void hittable_list_sort_bound(HittableList *hittables, HittableRefList *list, u6
   mem_arena_free(&copy_arena);
 }
 
-Hittable make_hittable_translation(HittableList *world, HittableRef hittable_idx, vec3 offset) {
+Hittable make_hittable_translation(HittableList *hittables, HittableRef hittable_idx, vec3 offset) {
   Hittable result = { VIS_OBJECT_TRANSLATION };
   result.translation.idx = hittable_idx;
   result.translation.offset = offset;
   result.translation.bounding_box = 
-    aabb_add_offset(*hittable_get_bounding_box(&world->objects[hittable_idx]), offset);
+    aabb_add_offset(*hittable_get_bounding_box(&hittables->objects[hittable_idx]), offset);
   return result;
 }
 
-Hittable make_hittable_y_rotation(HittableList *world, HittableRef hittable_idx, f32 angle) {
+Hittable make_hittable_y_rotation(HittableList *hittables, HittableRef hittable_idx, f32 angle) {
   Hittable result = { VIS_OBJECT_Y_ROTATION };
   result.y_rotation.idx = hittable_idx;
   f32 radians = degrees_to_radians(angle);
   result.y_rotation.sin_theta = sinf(radians);
   result.y_rotation.cos_theta = cosf(radians);
-  result.y_rotation.bounding_box = *hittable_get_bounding_box(&world->objects[hittable_idx]);
+  result.y_rotation.bounding_box = *hittable_get_bounding_box(&hittables->objects[hittable_idx]);
 
   YRotation *yrot = &result.y_rotation;
 
@@ -1704,20 +1740,6 @@ void init_rng(curandState* rng, unsigned int seed, int n) {
     curand_init(seed, i, 0, &rng[i]);
 }
 
-#define PTR_TO_INT(p) (u64)((u8*)p - (u8*)0)
-#define INT_TO_PTR(n) (u8*)((u8*)0 + (n))
-
-//NOTE: alignment must be a power of 2
-__device__ __host__
-inline u64 align_up(u64 p, u64 alignment) {
-  return (p + alignment - 1) & ~(alignment - 1);
-}
-
-__device__ __host__
-inline u8 *align_ptr_up(u8 *p, u64 alignment) {
-  return INT_TO_PTR(align_up(PTR_TO_INT(p), alignment));
-}
-
 __global__
 void init_gpu_data(PerPixelGpuData *gd, RayColorStackData *rcsd, WorldRef *hrs, 
     i32 max_bounces, u32 max_bvh_depth) {
@@ -1787,13 +1809,12 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   HittableList gpu_hittables = *hittables;
   gpu_hittables.objects = gpu_hittable_data;
 
-  Texture *gpu_texture_data;
-  u64 texture_data_size = textures->count * sizeof(Texture);
-  cudaMalloc(&gpu_texture_data, texture_data_size);
-  cudaMemcpy(gpu_texture_data, textures->data, texture_data_size, cudaMemcpyHostToDevice);
+  u8 *gpu_texture_data;
+  cudaMalloc(&gpu_texture_data, textures->arena.current_pos);
+  cudaMemcpy(gpu_texture_data, textures->arena.data, textures->arena.current_pos, cudaMemcpyHostToDevice);
 
   TextureList gpu_textures = *textures;
-  gpu_textures.data = gpu_texture_data;
+  gpu_textures.arena.data = gpu_texture_data;
 
   HittableRef *gpu_hittable_refs;
   u64 hittable_refs_size = world->count * sizeof(HittableRef);
@@ -1865,8 +1886,6 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
 
   vec3 *cpu_pixels_colors = (vec3 *)malloc(n * sizeof(vec3));
   cudaMemcpy(cpu_pixels_colors, pixels_colors, n * sizeof(vec3), cudaMemcpyDeviceToHost);
-  vec3 pixel = cpu_pixels_colors[30 * img_width + 40];
-  printf("pixel1=%f,%f,%f\n", pixel.x, pixel.y, pixel.z);
   pixels_to_ppm(cpu_pixels_colors, img_width, img_height);
 }
 
@@ -1874,10 +1893,40 @@ void render(HittableList *hittables, TextureList *textures, HittableRefList *wor
   render_w_settings(hittables, textures, world, &g_default_render_settings);
 }
 
+inline
+WorldRef world_add(HittableList *hittables, HittableRefList *world, Hittable hittable) {
+  return hittable_ref_list_add(world, hittable_list_add(hittables, hittable));
+}
+
+inline
+WorldRef world_add_rotated(HittableList *hittables, HittableRefList *world, Hittable hittable, f32 angle) {
+  return world_add(hittables,
+      world,
+      make_hittable_y_rotation(hittables, hittable_list_add(hittables, hittable), angle));
+}
+
+inline
+WorldRef world_add_translated(HittableList *hittables, HittableRefList *world,
+    Hittable hittable, vec3 offset) {
+  return world_add(hittables,
+      world,
+      make_hittable_translation(hittables, hittable_list_add(hittables, hittable), offset));
+}
+
+inline
+WorldRef world_add_rotated_translated(HittableList *hittables, HittableRefList *world,
+    Hittable hittable, f32 angle, vec3 offset) {
+  HittableRef ref = hittable_list_add(hittables,hittable);
+  ref = hittable_list_add(hittables, make_hittable_y_rotation(hittables, ref, angle));
+  ref = hittable_list_add(hittables,
+      make_hittable_translation(hittables, ref, offset));
+  return hittable_ref_list_add(world, ref);
+}
+
 void bouncing_spheres_scene() {
   MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
-  TextureList textures = make_texture_list(&texture_arena, WORLD_SIZE);
+  mem_arena_alloc(&texture_arena, MB(5));
+  TextureList textures = make_texture_list(&texture_arena);
 
   MemArena hittable_ref_arena = {0};
   mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
@@ -1949,8 +1998,8 @@ void bouncing_spheres_scene() {
 
 void checkered_spheres_scene() {
   MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
-  TextureList textures = make_texture_list(&texture_arena, WORLD_SIZE);
+  mem_arena_alloc(&texture_arena, MB(5));
+  TextureList textures = make_texture_list(&texture_arena);
 
   MemArena hittable_ref_arena = {0};
   mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
@@ -1992,20 +2041,25 @@ void checkered_spheres_scene() {
 
 void earth_scene() {
   MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE);
-  TextureList textures = make_texture_list(&texture_arena, WORLD_SIZE);
+  mem_arena_alloc(&texture_arena, MB(10));
+  TextureList textures = make_texture_list(&texture_arena);
 
   TextureRef earth_texture = texture_list_add(&textures, make_image_texture("earthmap.jpg"));
   Material earth_surface = make_lambertian(earth_texture);
 
   Hittable globe = make_hittable_sphere(Vec3(0,0,0), 2.0f, earth_surface);
 
-  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
 
-  HittableList world = {0};
-  world.objects = hittables;
-  world.size = WORLD_SIZE;
-  hittable_list_add(&world, globe);
+  HittableList hittables = {0};
+  hittables.objects = hittables_data;
+  hittables.size = WORLD_SIZE;
+
+  MemArena hittable_ref_arena = {0};
+  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
+  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+
+  world_add_rotated(&hittables, &world, globe, 15);
 
   RenderSettings settings = g_default_render_settings;
   settings.img_width = 400;
@@ -2014,22 +2068,31 @@ void earth_scene() {
   settings.lookat = Vec3(0, 0, 0);
   settings.defocus_angle = 0;
 
-  render_w_settings(&world, &textures, &settings);
+  render_w_settings(&hittables, &textures, &world, &settings);
 }
 
 void perlin_spheres_scene() {
+  MemArena texture_arena = {0};
+  mem_arena_alloc(&texture_arena, MB(5));
+  TextureList textures = make_texture_list(&texture_arena);
+
+  MemArena hittable_ref_arena = {0};
+  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
+  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+
   PerlinNoise noise = make_perlin_noise();
-  Texture noise_tex = make_noise_texture(&noise, 4);
-  Hittable ground = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(&noise_tex));
-  Hittable sphere = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(&noise_tex));
+  TextureRef noise_tex = texture_list_add(&textures, make_noise_texture(&noise, 4));
+  Hittable ground = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(noise_tex));
+  Hittable sphere = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(noise_tex));
 
-  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
 
-  HittableList world = {0};
-  world.objects = hittables;
-  world.size = WORLD_SIZE;
-  hittable_list_add(&world, ground);
-  hittable_list_add(&world, sphere);
+  HittableList hittables = {0};
+  hittables.objects = hittables_data;
+  hittables.size = WORLD_SIZE;
+
+  world_add(&hittables, &world, ground);
+  world_add(&hittables, &world, sphere);
 
   RenderSettings settings = g_default_render_settings;
   settings.img_width = 400;
@@ -2038,7 +2101,7 @@ void perlin_spheres_scene() {
   settings.lookat = Vec3(0, 0, 0);
   settings.defocus_angle = 0;
 
-  render_w_settings(&world, &settings);
+  render_w_settings(&hittables, &textures, &world, &settings);
 }
 
 /*
@@ -2082,47 +2145,55 @@ void quads_scene() {
 
   render_w_settings(&world, &settings);
 }
+*/
 
 void simple_light_scene() {
-  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+  MemArena texture_arena = {0};
+  mem_arena_alloc(&texture_arena, MB(5));
+  TextureList textures = make_texture_list(&texture_arena);
 
-  HittableList world = {0};
-  world.objects = hittables;
-  world.size = WORLD_SIZE;
+  MemArena hittable_ref_arena = {0};
+  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
+  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+
+  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList hittables = {0};
+  hittables.objects = hittables_data;
+  hittables.size = WORLD_SIZE;
 
   PerlinNoise noise = make_perlin_noise();
-  Texture perlin_texture = make_noise_texture(&noise, 4);
-  Hittable sphere1 = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(&perlin_texture));
-  Hittable sphere2 = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(&perlin_texture));
+  TextureRef noise_tex = texture_list_add(&textures, make_noise_texture(&noise, 4));
+  Hittable sphere1 = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(noise_tex));
+  Hittable sphere2 = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(noise_tex));
 
-  Texture sc = make_solid_color_texture(Vec3(4, 4, 4));
+  TextureRef sc = texture_list_add(&textures, make_solid_color_texture(Vec3(4, 4, 4)));
   Hittable light_quad =
-    make_hittable_quad(Vec3(3, 1, -2), Vec3(2, 0, 0), Vec3(0, 2, 0), make_diffuse_light(&sc));
-  Hittable light_sphere = make_hittable_sphere(Vec3(0, 7, 0), 2, make_diffuse_light(&sc));
+    make_hittable_quad(Vec3(3, 1, -2), Vec3(2, 0, 0), Vec3(0, 2, 0), make_diffuse_light(sc));
+  Hittable light_sphere = make_hittable_sphere(Vec3(0, 7, 0), 2, make_diffuse_light(sc));
 
-  hittable_list_add(&world, sphere1);
-  hittable_list_add(&world, sphere2);
-  hittable_list_add(&world, light_quad);
-  hittable_list_add(&world, light_sphere);
+  world_add(&hittables, &world, sphere1);
+  world_add(&hittables, &world, sphere2);
+  world_add(&hittables, &world, light_quad);
+  world_add(&hittables, &world, light_sphere);
 
   RenderSettings settings = {0};
   settings.img_ratio = 16.0f / 9.0f;
-  settings.img_width = 400;
-  settings.samples_per_pixel = 100;
+  settings.img_width = 1080;
+  settings.samples_per_pixel = 1000;
   settings.max_bounces = 50;
   settings.vfov = 20;
   settings.lookfrom = Vec3(26, 3, 6);
   settings.lookat = Vec3(0, 2, 0);
   settings.view_up = Vec3(0, 1, 0);
 
-  render_w_settings(&world, &settings);
+  render_w_settings(&hittables, &textures, &world, &settings);
 }
-*/
 
 void cornell_box_scene() {
   MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, sizeof(Texture) * WORLD_SIZE * 2);
-  TextureList textures = make_texture_list(&texture_arena, WORLD_SIZE);
+  mem_arena_alloc(&texture_arena, MB(5));
+  TextureList textures = make_texture_list(&texture_arena);
 
   MemArena hittable_ref_arena = {0};
   mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
@@ -2208,10 +2279,10 @@ i32 main() {
   // vec3_to_unit_vec_test();
 
   //bouncing_spheres_scene();
-  checkered_spheres_scene();
-  // earth_scene();
-  // perlin_spheres_scene();
+  //checkered_spheres_scene();
+  //earth_scene();
+  //perlin_spheres_scene();
   // quads_scene();
   // simple_light_scene();
-  //cornell_box_scene();
+  cornell_box_scene();
 }
