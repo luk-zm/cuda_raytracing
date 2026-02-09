@@ -9,9 +9,11 @@ typedef struct {
   i32 perm_z[PERLIN_NOISE_POINTS_COUNT];
 } PerlinNoise;
 
-f32 perlin_noise_val(PerlinNoise *noise, vec3 point);
+__host__ __device__ 
+inline f32 perlin_noise_val(PerlinNoise *noise, vec3 point);
 void perlin_noise_gen_permutation(i32 *arr, i32 count);
 PerlinNoise make_perlin_noise();
-f32 perlin_turbulence(PerlinNoise *noise, vec3 point, i32 depth);
+__host__ __device__ 
+inline f32 perlin_turbulence(PerlinNoise *noise, vec3 point, i32 depth);
 
 #endif

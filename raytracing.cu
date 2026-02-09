@@ -195,12 +195,22 @@ typedef struct {
   vec3 q;
   vec3 u;
   vec3 v;
-  Material mat;
-  Aabb bounding_box;
-  vec3 normal;
   f32 d;
   vec3 w;
+  vec3 normal;
+} Geometry;
+
+typedef struct {
+  Geometry geom;
+  Material mat;
+  Aabb bounding_box;
 } Quad;
+
+typedef struct {
+  Geometry geom;
+  Material mat;
+  Aabb bounding_box;
+} Triangle;
 
 typedef struct Hittable Hittable;
 typedef HittableRef WorldRef;
@@ -215,7 +225,7 @@ typedef u32 VisObject;
 enum {
   VIS_OBJECT_SPHERE,
   VIS_OBJECT_BVH_NODE,
-  VIS_OBJECT_HITTABLE_LIST,
+  VIS_OBJECT_TRIANGLE,
   VIS_OBJECT_QUAD,
   VIS_OBJECT_TRANSLATION,
   VIS_OBJECT_Y_ROTATION,
@@ -237,13 +247,13 @@ typedef struct {
 } HittableStructure;
 
 typedef struct {
-  u64 idx;
+  HittableRef idx;
   vec3 offset;
   Aabb bounding_box;
 } Translation;
 
 typedef struct {
-  u64 idx;
+  HittableRef idx;
   f32 sin_theta;
   f32 cos_theta;
   Aabb bounding_box;
@@ -254,7 +264,7 @@ struct Hittable {
   union {
     Sphere sphere;
     BvhNode bvh_node;
-    HittableList hlist;
+    Triangle triangle;
     Quad quad;
     Translation translation;
     YRotation y_rotation;
@@ -307,6 +317,7 @@ typedef struct {
 typedef struct {
   RayColorStack rc_stack;
   HittableRefStack hit_stack;
+  curandState rng;
 } PerPixelGpuData;
 
 __host__ __device__
@@ -671,20 +682,64 @@ Hittable make_hittable_sphere(vec3 center, f32 radius, Material mat) {
 }
 
 Quad make_quad(vec3 q, vec3 u, vec3 v, Material mat) {
-  Quad result = { q, u, v, mat };
+  Quad result = {0};
+
+  Geometry geom = { q, u, v };
+  vec3 n = vec3_cross_product(u, v);
+  geom.w = vec3_scale(1.0f/vec3_dot_prod(n, n), n);
+  geom.normal = vec3_to_unit_vec(n);
+  geom.d = vec3_dot_prod(geom.normal, q);
+  result.geom = geom;
+
+  result.mat = mat;
+
   Aabb bbox1 = make_aabb(q, vec3_add(q, vec3_add(u, v)));
   Aabb bbox2 = make_aabb(vec3_add(q, u), vec3_add(q, v));
   result.bounding_box = aabb_merge(&bbox1, &bbox2);
+  return result;
+}
+
+Triangle make_triangle(vec3 q, vec3 u, vec3 v, Material mat) {
+  Triangle result = {0};
+
+  Geometry geom = { q, u, v };
   vec3 n = vec3_cross_product(u, v);
-  result.w = vec3_scale(1.0f/vec3_dot_prod(n, n), n);
-  result.normal = vec3_to_unit_vec(n);
-  result.d = vec3_dot_prod(result.normal, q);
+  geom.w = vec3_scale(1.0f/vec3_dot_prod(n, n), n);
+  geom.normal = vec3_to_unit_vec(n);
+  geom.d = vec3_dot_prod(geom.normal, q);
+  result.geom = geom;
+
+  result.mat = mat;
+
+  vec3 p1 = vec3_add(q, v);
+  vec3 p2 = vec3_add(q, u);
+  Aabb bbox = {0};
+  bbox.x0 = MIN(q.x, MIN(p1.x, p2.x));
+  bbox.x1 = MAX(q.x, MAX(p1.x, p2.x));
+  bbox.y0 = MIN(q.y, MIN(p1.y, p2.y));
+  bbox.y1 = MAX(q.y, MAX(p1.y, p2.y));
+  bbox.z0 = MIN(q.z, MIN(p1.z, p2.z));
+  bbox.z1 = MAX(q.z, MAX(p1.z, p2.z));
+  f32 epsilon = 1e-3f;
+  bbox.x0 -= epsilon;
+  bbox.x1 += epsilon;
+  bbox.y0 -= epsilon;
+  bbox.y1 += epsilon;
+  bbox.z0 -= epsilon;
+  bbox.z1 += epsilon;
+  result.bounding_box = bbox;
   return result;
 }
 
 Hittable make_hittable_quad(vec3 q, vec3 u, vec3 v, Material mat) {
   Hittable result = { VIS_OBJECT_QUAD };
   result.quad = make_quad(q, u, v, mat);
+  return result;
+}
+
+Hittable make_hittable_triangle(vec3 q, vec3 u, vec3 v, Material mat) {
+  Hittable result = { VIS_OBJECT_TRIANGLE };
+  result.triangle = make_triangle(q, u, v, mat);
   return result;
 }
 
@@ -708,8 +763,8 @@ Aabb *hittable_get_bounding_box(Hittable *hittable) {
     case VIS_OBJECT_BVH_NODE: {
       result = &hittable->bvh_node.bounding_box;
     } break;
-    case VIS_OBJECT_HITTABLE_LIST: {
-      result = &hittable->hlist.bounding_box;
+    case VIS_OBJECT_TRIANGLE: {
+      result = &hittable->triangle.bounding_box;
     } break;
     case VIS_OBJECT_QUAD: {
       result = &hittable->quad.bounding_box;
@@ -829,8 +884,8 @@ Hittable make_hittable_y_rotation(HittableList *hittables, HittableRef hittable_
     for (i32 j = 0; j < 2; ++j) {
       for (i32 k = 0; k < 2; ++k) {
         f32 x = i*yrot->bounding_box.x1 + (1-i)*yrot->bounding_box.x0;
-        f32 y = i*yrot->bounding_box.y1 + (1-j)*yrot->bounding_box.y0;
-        f32 z = i*yrot->bounding_box.z1 + (1-k)*yrot->bounding_box.z0;
+        f32 y = j*yrot->bounding_box.y1 + (1-j)*yrot->bounding_box.y0;
+        f32 z = k*yrot->bounding_box.z1 + (1-k)*yrot->bounding_box.z0;
 
         f32 new_x = yrot->cos_theta*x + yrot->sin_theta*z;
         f32 new_z = -yrot->sin_theta*x + yrot->cos_theta*z;
@@ -881,7 +936,7 @@ WorldRef make_bvh_node_from_hittable_list_bound(HittableList *hittables, Hittabl
   } else {
     HITTABLE_LIST_COMP_TYPE comp_type = random_i32_bound(0, 2);
     // TODO: investigate, cornell box is slower with this
-    //hittable_list_sort_bound(hittables, world, world_start, world_end, comp_type);
+    hittable_list_sort_bound(hittables, world, world_start, world_end, comp_type);
 #if 0
     for (u64 i = world_start; i < world_end - 1; ++i) {
       b32 comp = 0;
@@ -924,7 +979,7 @@ WorldRef make_bvh_node_from_hittable_list(HittableList *hittables, HittableRefLi
 }
 
 void hittable_structure_add(HittableList *list, HittableStructure *structure, Hittable hittable) {
-  if (structure->count < structure->size) {
+  if (structure->count <= structure->size) {
     hittable_list_set(list, structure->idx + structure->count, hittable);
     Aabb *other_bbox = hittable_get_bounding_box(&hittable);
     structure->bounding_box = aabb_merge(&structure->bounding_box, other_bbox);
@@ -954,13 +1009,47 @@ Hittable make_box(HittableList *world, vec3 a, vec3 b, Material mat) {
   vec3 dy = { 0, max.y - min.y, 0 };
   vec3 dz = { 0, 0, max.z - min.z };
 
-  hittable_structure_add(world, &box.hstructure, make_hittable_quad(Vec3(min.x, min.y, max.z), dx, dy, mat));
-  hittable_structure_add(world, &box.hstructure, make_hittable_quad(Vec3(max.x, min.y, max.z), vec3_sign_flip(dz), dy, mat));
-  hittable_structure_add(world, &box.hstructure, make_hittable_quad(Vec3(max.x, min.y, min.z), vec3_sign_flip(dx), dy, mat));
-  hittable_structure_add(world, &box.hstructure, make_hittable_quad(Vec3(min.x, min.y, min.z), dz, dy, mat));
-  hittable_structure_add(world, &box.hstructure, make_hittable_quad(Vec3(min.x, max.y, max.z), dx, vec3_sign_flip(dz), mat));
-  hittable_structure_add(world, &box.hstructure, make_hittable_quad(Vec3(min.x, min.y, min.z), dx, dz, mat));
+  hittable_structure_add(world, &box.hstructure, 
+      make_hittable_quad(Vec3(min.x, min.y, max.z), dx, dy, mat));
+  hittable_structure_add(world, &box.hstructure, 
+      make_hittable_quad(Vec3(max.x, min.y, max.z), vec3_sign_flip(dz), dy, mat));
+  hittable_structure_add(world, &box.hstructure, 
+      make_hittable_quad(Vec3(max.x, min.y, min.z), vec3_sign_flip(dx), dy, mat));
+  hittable_structure_add(world, &box.hstructure, 
+      make_hittable_quad(Vec3(min.x, min.y, min.z), dz, dy, mat));
+  hittable_structure_add(world, &box.hstructure, 
+      make_hittable_quad(Vec3(min.x, max.y, max.z), dx, vec3_sign_flip(dz), mat));
+  hittable_structure_add(world, &box.hstructure, 
+      make_hittable_quad(Vec3(min.x, min.y, min.z), dx, dz, mat));
   return box;
+}
+
+Hittable make_pyramid(HittableList *world, vec3 base_a, vec3 base_b, vec3 tip, Material mat) {
+  Hittable pyramid = make_hittable_structure(world, 5);
+
+  vec3 min = { MIN(base_a.x, base_b.x), MIN(base_a.y, base_b.y), MIN(base_a.z, base_b.z) };
+  vec3 max = { MAX(base_a.x, base_b.x), MAX(base_a.y, base_b.y), MAX(base_a.z, base_b.z) };
+
+  vec3 dx = { max.x - min.x, 0, 0 };
+  vec3 dy = { 0, max.y - min.y, 0 };
+  vec3 dz = { 0, 0, max.z - min.z };
+
+  vec3 p1 = Vec3(min.x, min.y, min.z);
+  vec3 p2 = Vec3(max.x, min.y, min.z);
+  vec3 p3 = Vec3(max.x, min.y, max.z);
+  vec3 p4 = Vec3(min.x, min.y, max.z);
+
+  hittable_structure_add(world, &pyramid.hstructure, 
+      make_hittable_quad(Vec3(min.x, min.y, min.z), dx, dz, mat));
+  hittable_structure_add(world, &pyramid.hstructure, 
+      make_hittable_triangle(p1, dx, vec3_sub(tip, p1), mat));
+  hittable_structure_add(world, &pyramid.hstructure, 
+      make_hittable_triangle(p2, dz, vec3_sub(tip, p2), mat));
+  hittable_structure_add(world, &pyramid.hstructure, 
+      make_hittable_triangle(p3, vec3_sign_flip(dx), vec3_sub(tip, p3), mat));
+  hittable_structure_add(world, &pyramid.hstructure, 
+      make_hittable_triangle(p4, vec3_sign_flip(dz), vec3_sub(tip, p4), mat));
+  return pyramid;
 }
 
 // outward_normal is of unit length
@@ -972,30 +1061,40 @@ inline void hit_record_set_face_normal(HitRecord *record, Ray *ray, vec3 outward
 
 __host__ __device__
 inline b32 aabb_hit(Aabb *bbox, Ray *ray, f32 ray_t0, f32 ray_t1) {
-  //printf("%f, %f, %f, %f, %f, %f\n", bbox->x0, bbox->x1, bbox->y0, bbox->y1, bbox->z0, bbox->z1);
-  //printf("o (%f,%f,%f), d (%f,%f,%f)\n",
-      //ray->origin.x, ray->origin.y, ray->origin.z,
-      //ray->direction.x, ray->direction.y, ray->direction.z);
-  f32 t0_x = (bbox->x0 - ray->origin.x) / ray->direction.x;
-  f32 t1_x = (bbox->x1 - ray->origin.x) / ray->direction.x;
-
-  interval_sort(&t0_x, &t1_x);
-  if (!interval_overlap(t0_x, t1_x, ray_t0, ray_t1))
+  // x axis
+  f32 inv_dx = 1.0f / ray->direction.x;
+  f32 t0_x = (bbox->x0 - ray->origin.x) * inv_dx;
+  f32 t1_x = (bbox->x1 - ray->origin.x) * inv_dx;
+  if (inv_dx < 0.0f)
+    interval_sort(&t0_x, &t1_x);
+  ray_t0 = MAX(ray_t0, t0_x);
+  ray_t1 = MIN(ray_t1, t1_x);
+  if (ray_t1 <= ray_t0)
     return 0;
 
-  f32 t0_y = (bbox->y0 - ray->origin.y) / ray->direction.y;
-  f32 t1_y = (bbox->y1 - ray->origin.y) / ray->direction.y;
-
-  interval_sort(&t0_y, &t1_y);
-  if (!interval_overlap(t0_x, t1_x, t0_y, t1_y))
+  // y axis
+  f32 inv_dy = 1.0f / ray->direction.y;
+  f32 t0_y = (bbox->y0 - ray->origin.y) * inv_dy;
+  f32 t1_y = (bbox->y1 - ray->origin.y) * inv_dy;
+  if (inv_dy < 0.0f)
+    interval_sort(&t0_y, &t1_y);
+  ray_t0 = MAX(ray_t0, t0_y);
+  ray_t1 = MIN(ray_t1, t1_y);
+  if (ray_t1 <= ray_t0)
     return 0;
 
-  f32 t0_z = (bbox->z0 - ray->origin.z) / ray->direction.z;
-  f32 t1_z = (bbox->z1 - ray->origin.z) / ray->direction.z;
 
-  interval_sort(&t0_z, &t1_z);
-  b32 result = interval_overlap(t0_y, t1_y, t0_z, t1_z);
-  return result;
+  // z axis
+  f32 inv_dz = 1.0f / ray->direction.z;
+  f32 t0_z = (bbox->z0 - ray->origin.z) * inv_dz;
+  f32 t1_z = (bbox->z1 - ray->origin.z) * inv_dz;
+  if (inv_dz < 0.0f)
+    interval_sort(&t0_z, &t1_z);
+  ray_t0 = MAX(ray_t0, t0_z);
+  ray_t1 = MIN(ray_t1, t1_z);
+  if (ray_t1 <= ray_t0)
+    return 0;
+  return 1;
 }
 
 __host__ __device__
@@ -1010,7 +1109,7 @@ inline b32 href_stack_is_empty(HittableRefStack *stack) {
 __host__ __device__
 inline b32 href_stack_push(HittableRefStack *stack, HittableRef ref) {
   b32 result = 0;
-  assert(stack->count != stack->max_count);
+  //assert(stack->count != stack->max_count);
   stack->data[stack->count++] = ref;
   result = 1;
   return result;
@@ -1029,6 +1128,25 @@ inline HittableRef href_stack_pop(HittableRefStack *stack) {
 __host__ __device__ inline
 Hittable href_list_get(HittableRefList *refs, HittableList *hittables, HittableRef ref) {
   return hittables->objects[refs->data[ref]];
+}
+
+__host__ __device__
+inline void geom_calc_hit(Geometry *geom, Ray *ray, f32 ray_tmin, f32 ray_tmax,
+    f32 *out_alpha, f32 *out_beta, f32 *out_t, vec3 *out_intersection) {
+  f32 denom = vec3_dot_prod(geom->normal, ray->direction);
+  if (fabsf(denom) >= 1e-8) {
+    *out_t = (geom->d - vec3_dot_prod(geom->normal, ray->origin)) / denom;
+    if (ray_tmin <= *out_t && *out_t <= ray_tmax) {
+      *out_intersection = ray_at(ray, *out_t);
+      vec3 planar_hit_point = vec3_sub(*out_intersection, geom->q);
+      *out_alpha = vec3_dot_prod(geom->w, vec3_cross_product(planar_hit_point, geom->v));
+      *out_beta = vec3_dot_prod(geom->w, vec3_cross_product(geom->u, planar_hit_point));
+    } else {
+      *out_alpha = *out_beta = inf_f32();
+    }
+  } else {
+    *out_alpha = *out_beta = inf_f32();
+  }
 }
 
 __host__ __device__
@@ -1083,30 +1201,49 @@ inline b32 hit(PerPixelGpuData *gd, SceneData *sd, HittableRef idx,
           href_stack_push(stack, wref_to_href(&sd->world, node->left));
         }
       } break;
+      case VIS_OBJECT_TRIANGLE: {
+        Triangle *triangle = &hittable->triangle;
+        f32 alpha = 0.0f;
+        f32 beta = 0.0f;
+        f32 t = 0.0f;
+        vec3 intersection = {0};
+        geom_calc_hit(&triangle->geom, ray, ray_tmin, ray_tmax, &alpha, &beta, &t, &intersection);
+        if ((0.0f <= alpha && alpha <= 1.0f) &&
+            (0.0f <= beta && beta <= 1.0f) &&
+            (alpha + beta <= 1.0f)) {
+          record->u = alpha;
+          record->v = beta;
+          record->t = t;
+          record->point_hit = intersection;
+          record->mat = triangle->mat;
+          hit_record_set_face_normal(record, ray, triangle->geom.normal);
+
+          ray_tmax = record->t;
+          result = 1;
+          if (translation_cleanup_counter || yrot_cleanup_counter)
+            was_last_hit = 1;
+        }
+      } break;
       case VIS_OBJECT_QUAD: {
         Quad *quad = &hittable->quad;
-        f32 denom = vec3_dot_prod(quad->normal, ray->direction);
-        if (fabsf(denom) >= 1e-8) {
-          f32 t = (quad->d - vec3_dot_prod(quad->normal, ray->origin)) / denom;
-          if (ray_tmin <= t && t <= ray_tmax) {
-            vec3 intersection = ray_at(ray, t);
-            vec3 planar_hit_point = vec3_sub(intersection, quad->q);
-            f32 alpha = vec3_dot_prod(quad->w, vec3_cross_product(planar_hit_point, quad->v));
-            f32 beta = vec3_dot_prod(quad->w, vec3_cross_product(quad->u, planar_hit_point));
-            if ((0.0f <= alpha && alpha <= 1.0f) && (0.0f <= beta && beta <= 1.0f)) {
-              record->u = alpha;
-              record->v = beta;
-              record->t = t;
-              record->point_hit = intersection;
-              record->mat = quad->mat;
-              hit_record_set_face_normal(record, ray, quad->normal);
+        f32 alpha = 0.0f;
+        f32 beta = 0.0f;
+        f32 t = 0.0f;
+        vec3 intersection = {0};
+        geom_calc_hit(&quad->geom, ray, ray_tmin, ray_tmax, &alpha, &beta, &t, &intersection);
+        if ((0.0f <= alpha && alpha <= 1.0f) &&
+            (0.0f <= beta && beta <= 1.0f)) {
+          record->u = alpha;
+          record->v = beta;
+          record->t = t;
+          record->point_hit = intersection;
+          record->mat = quad->mat;
+          hit_record_set_face_normal(record, ray, quad->geom.normal);
 
-              ray_tmax = record->t;
-              result = 1;
-              if (translation_cleanup_counter || yrot_cleanup_counter)
-                was_last_hit = 1;
-            }
-          }
+          ray_tmax = record->t;
+          result = 1;
+          if (translation_cleanup_counter || yrot_cleanup_counter)
+            was_last_hit = 1;
         }
       } break;
       case VIS_OBJECT_TRANSLATION: {
@@ -1186,184 +1323,6 @@ inline b32 hit(PerPixelGpuData *gd, SceneData *sd, HittableRef idx,
   return result;
 }
 
-/*
- * TODO: delete once unneeded OLD RECURSIVE
-__host__ __device__
-inline b32 hit(HittableList *hittables, u64 idx, f32 ray_tmin, f32 ray_tmax, Ray *ray, HitRecord *record) {
-  Hittable *hittable = &hittables->objects[idx];
-  switch (hittable->type) {
-    case VIS_OBJECT_SPHERE: {
-      printf("-");
-      vec3 current_sphere_position = 
-        movement_path_at(&hittable->sphere.movement_path, ray->intersection_time);
-      vec3 oc = vec3_sub(current_sphere_position, ray->origin);
-      float a = vec3_dot_prod(ray->direction, ray->direction);
-      float b = -2.0f * vec3_dot_prod(ray->direction, oc);
-      float c = vec3_dot_prod(oc, oc) - hittable->sphere.radius * hittable->sphere.radius;
-      float discriminant = b * b - 4*a*c;
-
-      if (discriminant < 0)
-        return 0;
-
-      f32 sqrt_discriminant = sqrtf(discriminant);
-      f32 root = (-b - sqrt_discriminant) / (2.0f*a);
-      if (ray_tmin >= root || root >= ray_tmax) {
-        root = (-b + sqrt_discriminant) / (2.0f*a);
-        if (ray_tmin >= root || root >= ray_tmax) {
-          return 0;
-        }
-      }
-
-      record->t = root;
-      record->point_hit = ray_at(ray, root);
-      record->mat = hittable->sphere.mat;
-      vec3 outward_normal = vec3_scale(1.0f/hittable->sphere.radius,
-          vec3_sub(record->point_hit, current_sphere_position));
-      sphere_get_uv(&outward_normal, &record->u, &record->v);
-      hit_record_set_face_normal(record, ray, outward_normal);
-
-      return 1;
-    } break;
-    case VIS_OBJECT_BVH_NODE: {
-      BvhNode *node = &hittable->bvh_node;
-      if (aabb_hit(&node->bounding_box, ray, ray_tmin, ray_tmax)) {
-        b32 hit_left = hit(hittables, node->left, ray_tmin, ray_tmax, ray, record);
-        b32 hit_right =
-          hit(hittables, node->right, ray_tmin, hit_left ? record->t : ray_tmax, ray, record);
-        return hit_left || hit_right;
-      } else {
-        return 0;
-      }
-    } break;
-    case VIS_OBJECT_HITTABLE_LIST: {
-      return hittable_list_hit(&hittable->hlist, ray, ray_tmin, ray_tmax, record);
-    } break;
-    case VIS_OBJECT_QUAD: {
-      Quad *quad = &hittable->quad;
-      b32 is_hit = 0;
-      f32 denom = vec3_dot_prod(quad->normal, ray->direction);
-      if (fabsf(denom) >= 1e-8) {
-        f32 t = (quad->d - vec3_dot_prod(quad->normal, ray->origin)) / denom;
-        if (ray_tmin <= t && t <= ray_tmax) {
-          vec3 intersection = ray_at(ray, t);
-          vec3 planar_hit_point = vec3_sub(intersection, quad->q);
-          f32 alpha = vec3_dot_prod(quad->w, vec3_cross_product(planar_hit_point, quad->v));
-          f32 beta = vec3_dot_prod(quad->w, vec3_cross_product(quad->u, planar_hit_point));
-          if ((0.0f <= alpha && alpha <= 1.0f) && (0.0f <= beta && beta <= 1.0f)) {
-            record->u = alpha;
-            record->v = beta;
-            record->t = t;
-            record->point_hit = intersection;
-            record->mat = quad->mat;
-            hit_record_set_face_normal(record, ray, quad->normal);
-            is_hit = 1;
-          }
-        }
-      }
-      return is_hit;
-    } break;
-    case VIS_OBJECT_TRANSLATION: {
-      printf("(");
-      Translation *translation = &hittable->translation;
-      Ray offset_ray = { vec3_sub(ray->origin, translation->offset),
-        ray->direction,
-        ray->intersection_time };
-      if (hit(hittables, translation->idx, ray_tmin, ray_tmax, &offset_ray, record)) {
-        vec3_inplace_add(&record->point_hit, translation->offset);
-        return 1;
-      } else {
-        return 0;
-      }
-    } break;
-    case VIS_OBJECT_Y_ROTATION: {
-      printf(")");
-      YRotation *y_rot = &hittable->y_rotation;
-      vec3 rotated_origin = Vec3(
-          (y_rot->cos_theta * ray->origin.x) - (y_rot->sin_theta * ray->origin.z),
-          ray->origin.y,
-          (y_rot->sin_theta * ray->origin.x) + (y_rot->cos_theta * ray->origin.z)
-      );
-
-      vec3 rotated_direction = Vec3(
-          (y_rot->cos_theta * ray->direction.x) - (y_rot->sin_theta * ray->direction.z),
-          ray->direction.y,
-          (y_rot->sin_theta * ray->direction.x) + (y_rot->cos_theta * ray->direction.z)
-      );
-
-      Ray rotated_ray = { rotated_origin, rotated_direction, ray->intersection_time };
-
-      if (hit(hittables, y_rot->idx, ray_tmin, ray_tmax, &rotated_ray, record)) {
-        record->point_hit = Vec3(
-            (y_rot->cos_theta * record->point_hit.x) + (y_rot->sin_theta * record->point_hit.z),
-            record->point_hit.y,
-            (-y_rot->sin_theta * record->point_hit.x) + (y_rot->cos_theta * record->point_hit.z)
-        );
-
-        record->normal = Vec3(
-            (y_rot->cos_theta * record->normal.x) + (y_rot->sin_theta * record->normal.z),
-            record->normal.y,
-            (-y_rot->sin_theta * record->normal.x) + (y_rot->cos_theta * record->normal.z)
-        );
-        return 1;
-      } else {
-        return 0;
-      }
-    } break;
-    case VIS_OBJECT_HITTABLE_STRUCTURE: {
-      printf("+");
-      return hittable_structure_hit(hittables, &hittable->hstructure, ray, ray_tmin, ray_tmax, record);
-    } break;
-  }
-  return 0;
-}
-*/
-
-/* TODO: delete once unneeded - OUT OF DATE
-__device__
-vec3 ray_color_rec(TextureList *textures, curandState *rng, Ray *ray, i32 max_bounces, 
-    HittableList *world, vec3 background_color) {
-  printf("%d ", max_bounces);
-  vec3 result = {0};
-  if (max_bounces > 0) {
-    HitRecord record = {0};
-    if (hit(world, 0, 0.001f, inf_f32(), ray, &record)) {
-      vec3 emission_color =
-        material_emit(textures, &record.mat, record.u, record.v, record.point_hit);
-      ScatterRes scatter =
-        cuda_material_scatter(textures, rng, &record.mat, ray->direction, &record);
-      if (scatter.is_hit) {
-        Ray bounce = {0};
-        bounce.origin = record.point_hit;
-        bounce.direction = scatter.direction;
-        bounce.intersection_time = ray->intersection_time;
-  printf("6");
-  printf("%d ", max_bounces);
-  //printf("(%f,%f,%f), (%f,%f,%f), %f\n", bounce.origin.x, bounce.origin.y, bounce.origin.z,
-   //   bounce.direction.x, bounce.direction.y, bounce.direction.z, bounce.intersection_time);
-        vec3 scatter_color = vec3_comp_scale(scatter.attenuation,
-            ray_color_rec(textures, rng, &bounce, max_bounces - 1, world, background_color));
-            //Color(1, 1, 1));
-  printf("7");
-        result = vec3_add(scatter_color, emission_color);
-  printf("8");
-      } else {
-        result = emission_color;
-      }
-    } else {
-      result = background_color;
-    }
-  }
-
-#if 0
-  vec3 unit_direction = vec3_to_unit_vec(ray->direction);
-  f32 blend_percent = 0.5f * (unit_direction.y + 1.0f);
-  return vec3_add(vec3_scale(1.0f - blend_percent, Color(1.0f, 1.0f, 1.0f)),
-      vec3_scale(blend_percent, Color(0.5f, 0.7f, 1.0f)));
-#endif
-  return result;
-}
-*/
-
 __host__ __device__
 inline b32 ray_color_stack_is_empty(RayColorStack *stack) {
   return stack->count == 0;
@@ -1390,22 +1349,75 @@ inline void ray_color_stack_pop(RayColorStack *stack, vec3 *attenuation, vec3 *e
 }
 
 __device__
-vec3 ray_color(SceneData *sd, PerPixelGpuData *gd, curandState *rng, Ray *ray,
-    vec3 background_color) {
+vec3 ray_color_no_bvh(SceneData *sd, PerPixelGpuData *gd, Ray *ray, vec3 background_color) {
   i32 max_bounces = gd->rc_stack.max_count;
-  vec3 result = {0};
+  vec3 result = background_color;
   HitRecord record = {0};
-  Ray bounce = *ray;
+  Ray *bounce = ray;
+  b32 hit_anything = 0;
+  f32 ray_tmax = inf_f32();
   while (max_bounces > 0) {
-    if (hit(gd, sd, wref_to_href(&sd->world, sd->root_bvh_node),
-          0.001f, inf_f32(), &bounce, &record)) {
+    for (WorldRef i = 0;
+        i < sd->world.count && sd->hittables.objects[sd->world.data[i]].type != VIS_OBJECT_BVH_NODE; 
+        ++i) {
+      HitRecord temp_record = {0};
+      if (hit(gd, sd, wref_to_href(&sd->world, i),
+            0.001f, ray_tmax, bounce, &temp_record)) {
+        ray_tmax = temp_record.t;
+        hit_anything = 1;
+        record = temp_record;
+      }
+    }
+    if (hit_anything) {
       vec3 emission_color =
         material_emit(&sd->textures, &record.mat, record.u, record.v, record.point_hit);
       ScatterRes scatter =
-        cuda_material_scatter(&sd->textures, rng, &record.mat, bounce.direction, &record);
+        cuda_material_scatter(&sd->textures, &gd->rng, &record.mat, bounce->direction, &record);
       if (scatter.is_hit) {
-        bounce.origin = record.point_hit;
-        bounce.direction = scatter.direction;
+        bounce->origin = record.point_hit;
+        bounce->direction = scatter.direction;
+
+        ray_color_stack_push(&gd->rc_stack, scatter.attenuation, emission_color);
+        ray_tmax = record.t;
+      } else {
+        result = emission_color;
+        break;
+      }
+      hit_anything = 0;
+      ray_tmax = inf_f32();
+      max_bounces--;
+    } else {
+      result = background_color;
+      break;
+    }
+  }
+
+  while (!ray_color_stack_is_empty(&gd->rc_stack)) {
+    vec3 attenuation = {0};
+    vec3 emission_color = {0};
+    ray_color_stack_pop(&gd->rc_stack, &attenuation, &emission_color);
+    vec3 scatter_color = vec3_comp_scale(attenuation, result);
+    result = vec3_add(scatter_color, emission_color);
+  }
+
+  return result;
+}
+__device__
+vec3 ray_color(SceneData *sd, PerPixelGpuData *gd, Ray *ray, vec3 background_color) {
+  i32 max_bounces = gd->rc_stack.max_count;
+  vec3 result = {0};
+  HitRecord record = {0};
+  Ray *bounce = ray;
+  while (max_bounces > 0) {
+    if (hit(gd, sd, wref_to_href(&sd->world, sd->root_bvh_node),
+          0.001f, inf_f32(), bounce, &record)) {
+      vec3 emission_color =
+        material_emit(&sd->textures, &record.mat, record.u, record.v, record.point_hit);
+      ScatterRes scatter =
+        cuda_material_scatter(&sd->textures, &gd->rng, &record.mat, bounce->direction, &record);
+      if (scatter.is_hit) {
+        bounce->origin = record.point_hit;
+        bounce->direction = scatter.direction;
 
         ray_color_stack_push(&gd->rc_stack, scatter.attenuation, emission_color);
         max_bounces--;
@@ -1644,8 +1656,8 @@ void print_bvh_info(Hittable *nodes, HittableRef *refs, WorldRef idx) {
       print_bvh_info(nodes, refs, node->bvh_node.left);
       print_bvh_info(nodes, refs, node->bvh_node.right);
     } break;
-    case VIS_OBJECT_HITTABLE_LIST: {
-      printf("===hlist\n");
+    case VIS_OBJECT_TRIANGLE: {
+      printf("===triangle\n");
     } break;
     case VIS_OBJECT_QUAD: {
       printf("===quad\n");
@@ -1689,13 +1701,24 @@ static RenderSettings g_default_render_settings =
     }                                              \
 } while (0)
 
+#define MAX_RC_STACK 20
+
 __global__
 void cuda_calc(SceneData *sd, PerPixelGpuData *gd, vec3 *pixels_colors, i32 img_width, i32 n, 
     RenderSettings settings, vec3 pixel_delta_v, vec3 pixel_delta_u, vec3 camera_pos,
     vec3 defocus_disk_u, vec3 defocus_disk_v, f32 pixel_samples_scale,
-    vec3 current_pixel_center, curandState *rng) {
+    vec3 current_pixel_center) {
   i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
   i32 stride = blockDim.x * gridDim.x;
+  if (idx >= n)
+    return;
+
+  PerPixelGpuData local_gd = gd[idx];
+#if 0
+  RayColorStackData local_stack_data[MAX_RC_STACK] = {0};
+  local_gd.rc_stack.data = (RayColorStackData *)&local_stack_data;
+  local_gd.rc_stack.max_count = MAX_RC_STACK;
+#endif
 
   for (i32 curr_idx = idx; curr_idx < n; curr_idx += stride) {
     i32 j = curr_idx % img_width;
@@ -1705,52 +1728,85 @@ void cuda_calc(SceneData *sd, PerPixelGpuData *gd, vec3 *pixels_colors, i32 img_
           current_pixel_center, vec3_add(
             vec3_scale((f32)i, pixel_delta_v),
             vec3_scale((f32)j, pixel_delta_u)));
-    curandState local_rng = rng[curr_idx];
     i32 samples_per_pixel = settings.samples_per_pixel;
     for (i32 sample_num = 0; sample_num < samples_per_pixel; ++sample_num) {
       Ray sampling_ray = {0};
       sampling_ray.origin = (settings.defocus_angle <= 0) ?
-        camera_pos : cuda_defocus_disk_sample(&local_rng, camera_pos, defocus_disk_u, defocus_disk_v);
-      f32 x_offset = curand_uniform(&local_rng) - 0.5f;
-      f32 y_offset = curand_uniform(&local_rng) - 0.5f;
+        camera_pos : cuda_defocus_disk_sample(&local_gd.rng, camera_pos, defocus_disk_u, defocus_disk_v);
+      f32 x_offset = curand_uniform(&local_gd.rng) - 0.5f;
+      f32 y_offset = curand_uniform(&local_gd.rng) - 0.5f;
       sampling_ray.direction = vec3_sub(current_ray_direction, sampling_ray.origin);
       vec3_inplace_add(&sampling_ray.direction, vec3_scale(x_offset, pixel_delta_u));
       vec3_inplace_add(&sampling_ray.direction, vec3_scale(y_offset, pixel_delta_v));
-      sampling_ray.intersection_time = curand_uniform(&local_rng);
+      sampling_ray.intersection_time = curand_uniform(&local_gd.rng);
 
       vec3_inplace_add(&pixels_colors[curr_idx],
           ray_color(sd,
-            &gd[idx],
-            &local_rng,
+            &local_gd,
             &sampling_ray, 
             settings.background_color));
     }
-    rng[curr_idx] = local_rng;
     vec3_inplace_scale(pixel_samples_scale, &pixels_colors[curr_idx]);
   }
-}
-
-__global__
-void init_rng(curandState* rng, unsigned int seed, int n) {
-    u64 i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i == 0) printf("Entered init rng\n");
-    if (i == n) printf("Finished init_rng\n");
-    if (i >= n) return;
-
-    curand_init(seed, i, 0, &rng[i]);
+  gd[idx].rng = local_gd.rng;
 }
 
 __global__
 void init_gpu_data(PerPixelGpuData *gd, RayColorStackData *rcsd, WorldRef *hrs, 
-    i32 max_bounces, u32 max_bvh_depth) {
+    i32 max_bounces, u32 max_bvh_depth, u32 seed, u64 n) {
     u64 i = blockIdx.x * blockDim.x + threadIdx.x;
-    gd[i].rc_stack.max_count = max_bounces;
-    gd[i].rc_stack.count = 0;
-    gd[i].rc_stack.data = &rcsd[i * max_bounces];
+    if (i < n) {
+      gd[i].rc_stack.max_count = max_bounces;
+      gd[i].rc_stack.count = 0;
+      gd[i].rc_stack.data = &rcsd[i * max_bounces];
 
-    gd[i].hit_stack.max_count = max_bvh_depth;
-    gd[i].hit_stack.count = 0;
-    gd[i].hit_stack.data = &hrs[i * max_bvh_depth];
+      gd[i].hit_stack.max_count = max_bvh_depth;
+      gd[i].hit_stack.count = 0;
+      gd[i].hit_stack.data = &hrs[i * max_bvh_depth];
+
+      curand_init(seed, i, 0, &gd[i].rng);
+    }
+}
+
+typedef struct {
+  HittableList all;
+  TextureList textures;
+  HittableRefList bvh_include;
+} World;
+
+i32 hittable_depth(World *world, HittableRef href) {
+  i32 result = 0;
+  Hittable *hittable = &world->all.objects[href];
+  switch (hittable->type) {
+    case VIS_OBJECT_SPHERE:
+    case VIS_OBJECT_TRIANGLE:
+    case VIS_OBJECT_QUAD: {
+      result = 1;
+    } break;
+    case VIS_OBJECT_TRANSLATION: {
+      result = 2 + hittable_depth(world, hittable->translation.idx);
+    } break;
+    case VIS_OBJECT_Y_ROTATION: {
+      result = 2 + hittable_depth(world, hittable->y_rotation.idx);
+    } break;
+    case VIS_OBJECT_HITTABLE_STRUCTURE: {
+      result = hittable->hstructure.size;
+    } break;
+    default: {
+      result = 0;
+    } break;
+  }
+  return result;
+}
+
+i32 world_max_depth(World *world) {
+  i32 result = 0;
+  for (WorldRef i = 0; i < world->bvh_include.count; ++i) {
+    i32 curr_depth = hittable_depth(world, wref_to_href(&world->bvh_include, i));
+    if (curr_depth > result)
+      result = curr_depth;
+  }
+  return result;
 }
 
 void render_w_settings(HittableList *hittables, TextureList *textures,
@@ -1838,8 +1894,9 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   cudaMemcpy(gpu_sd, &sd, sizeof(SceneData), cudaMemcpyHostToDevice);
 
   u64 max_bvh_depth = logf(world->count) / logf(2.0f) + 1;
+  World tmp = { *hittables, *textures, *world };
   // NOTE: take into account y_rotation, translation and hittable_structure hit calls
-  max_bvh_depth += 10;
+  max_bvh_depth += world_max_depth(&tmp);
 
   PerPixelGpuData *gd;
   cudaMalloc(&gd, n * sizeof(PerPixelGpuData));
@@ -1849,26 +1906,16 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   cudaMalloc(&hit_stacks_data, n * sizeof(WorldRef) * max_bvh_depth);
 
   init_gpu_data<<<num_blocks, block_size>>>(gd, rc_stacks_data, hit_stacks_data,
-      settings->max_bounces, max_bvh_depth);
+      settings->max_bounces, max_bvh_depth, 1234, n);
   cudaDeviceSynchronize();
 
   cudaError_t err;
 
   f64 time_start = timer_start_ms();
   f64 time_start_s = timer_start();
-  curandState *d_rng;
-  cudaMalloc(&d_rng, n*sizeof(curandState));
-  err = cudaGetLastError();
-  printf("d_rng malloc error: %s\n", cudaGetErrorString(err));
-  init_rng<<<num_blocks, block_size>>>(d_rng, 1234, n);
-  err = cudaGetLastError();
-  printf("init_rng launch error: %s\n", cudaGetErrorString(err));
-  cudaDeviceSynchronize();
-  err = cudaGetLastError();
-  printf("init_rng sync error: %s\n", cudaGetErrorString(err));
   cuda_calc<<<num_blocks, block_size>>>(gpu_sd, gd, pixels_colors, img_width, n, *settings,
       pixel_delta_v, pixel_delta_u, camera_pos, defocus_disk_u, defocus_disk_v,
-      pixel_samples_scale, current_pixel_center, d_rng);
+      pixel_samples_scale, current_pixel_center);
   //CUDA_CHECK(cudaDeviceSynchronize());
   //CUDA_CHECK(cudaGetLastError());
 
@@ -2233,6 +2280,32 @@ void cornell_box_scene() {
         hittable_list_add(&hittables, 
           make_hittable_quad(Vec3(0,0,555), Vec3(555,0,0), Vec3(0,555,0), white)));
 
+#if 1
+  Material metal = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.6f);
+  world_add_rotated_translated(&hittables, 
+      &world, 
+      make_pyramid(&hittables, Vec3(0, 0, 0), Vec3(160, 0, 160), Vec3(100,400,100), red), 
+      60,
+      Vec3(200, 0, 150));
+
+#else
+  // BUG?: wall doesn't render without sorting when creating bvh
+  world_add_translated(&hittables, 
+      &world, 
+      make_hittable_quad(Vec3(0, 0, 0), Vec3(100, 0, 0), Vec3(50, 50, 50), green), 
+      Vec3(500, 200, 100));
+
+  world_add_translated(&hittables, 
+      &world, 
+      make_hittable_quad(Vec3(0, 0, 0), Vec3(100, 0, 0), Vec3(50, 50, 50), green), 
+      Vec3(100, 200, 100));
+
+  world_add_translated(&hittables, 
+      &world, 
+      make_hittable_quad(Vec3(0, 0, 0), Vec3(100, 0, 0), Vec3(50, 50, 50), green), 
+      Vec3(0, 200, 100));
+#endif
+
 #if 0
   HittableRef box1 = hittable_list_add(&hittables,
       make_box(&hittables, Vec3(130, 0, 65), Vec3(295, 165, 230), white));
@@ -2257,14 +2330,14 @@ void cornell_box_scene() {
       make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 165, 165), white));
   box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
   box2 = hittable_list_add(&hittables,
-      make_hittable_translation(&hittables, box2, Vec3(130, 0, 65)));
+      make_hittable_translation(&hittables, box2, Vec3(130, 0, -10)));
   hittable_ref_list_add(&world, box2);
 #endif
 
   RenderSettings settings = {0};
   settings.img_ratio = 1.0f;
   settings.img_width = 600;
-  settings.samples_per_pixel = 1000;
+  settings.samples_per_pixel = 2000;
   settings.max_bounces = 50;
   settings.vfov = 40;
   settings.lookfrom = Vec3(278, 278, -800);
@@ -2274,6 +2347,61 @@ void cornell_box_scene() {
 
   render_w_settings(&hittables, &textures, &world, &settings);
 }
+
+#if 0
+void final_scene(World *world) {
+  Material ground_mat = add_mat_lamb_sc(world, Vec3(0.48f, 0.83f, 0.53f));
+
+  i32 boxes_per_side = 20;
+  for (i32 i = 0; i < boxes_per_side; ++i) {
+    for (i32 j = 0; j < boxes_per_side; ++j) {
+      f32 w = 100;
+      f32 x0 = -1000.0f + i * w;
+      f32 z0 = -1000.0f + j * w;
+      f32 y0 = 0;
+      f32 x1 = x0 + w;
+      f32 y1 = random_f32_bound(1, 101);
+      f32 z1 = z0 + w;
+
+      add_box(world, Vec3(x0, y0, z0), Vec3(x1, y1, z1), ground_mat);
+    }
+  }
+
+  Material light = add_mat_light_sc(world, Vec3(7, 7, 7));
+  add_quad(world, Vec3(123, 554, 147), Vec3(300, 0, 0), Vec3(0, 0, 265), light);
+
+  vec3 center1 = { 400, 400, 200 };
+  vec3 center2 = vec3_add(center1, Vec3(30, 0, 0));
+  Material sphere_mat = add_mat_lamb_sc(world, Vec3(0.7f, 0.3f, 0.1f));
+  add_mov_sphere(world, center1, center2, 50, sphere_mat);
+
+  add_sphere(world, Vec3(260, 140, 45), 40, add_mat_dielectric(world, 1.5f));
+  add_sphere(world, Vec3(0, 150, 145), 50, add_mat_metal_sc(world, Vec3(0.8f, 0.8f, 0.9f), 1.0f));
+
+  Material earth_mat = add_mat_img("earthmap.jpg");
+  add_sphere(world, Vec3(400, 200, 400), 100, earth_mat);
+  Material perlin_noise = add_mat_lamb_noise(world, 0.2f);
+
+  Material white = add_mat_lamb_sc(world, Vec3(0.73f, 0.73f, 0.73f));
+  i32 ns = 1000;
+  for (i32 i = 0; i < ns; ++i) {
+    add_sphere(vec3_random_bound(0, 165), 10, white);
+  }
+
+  RenderSettings settings = {0};
+  settings.img_ratio = 1.0f;
+  settings.img_width = 400;
+  settings.samples_per_pixel = 100;
+  settings.max_bounces = 50;
+  settings.vfov = 40.0f;
+  settings.lookfrom = Vec3(478, 278, -600);
+  settings.lookat = Vec3(278, 278, 0);
+  settings.view_up = Vec3(0.0f, 0.1f, 0.0f);
+  settings.defocus_angle = 0.0f;
+  
+  render(world, settings);
+}
+#endif
 
 i32 main() {
   // vec3_to_unit_vec_test();

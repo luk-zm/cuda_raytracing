@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define MIN(a,b) a < b ? a : b
-#define MAX(a,b) a < b ? b : a
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+#define MAX(a,b) (((a) < (b)) ? (b) : (a))
 #define CLAMP(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
 #define MB(n) (n) << 20
 #define KB(n) (n) << 10
