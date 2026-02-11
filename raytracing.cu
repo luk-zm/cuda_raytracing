@@ -16,7 +16,7 @@
 // unity build
 #include "perlin_noise.c"
 
-#define WORLD_SIZE 1000
+#define WORLD_SIZE 8000
 
 #define PTR_TO_INT(p) (u64)((u8*)p - (u8*)0)
 #define INT_TO_PTR(n) (u8*)((u8*)0 + (n))
@@ -754,6 +754,12 @@ Sphere make_moving_sphere(vec3 center, vec3 destination, f32 radius, Material ma
   return s;
 }
 
+Hittable make_hittable_moving_sphere(vec3 center, vec3 destination, f32 radius, Material mat) {
+  Hittable result = { VIS_OBJECT_SPHERE };
+  result.sphere = make_moving_sphere(center, destination, radius, mat);
+  return result;
+}
+
 Aabb *hittable_get_bounding_box(Hittable *hittable) {
   Aabb *result = NULL;
   switch (hittable->type) {
@@ -906,6 +912,7 @@ Hittable make_hittable_y_rotation(HittableList *hittables, HittableRef hittable_
 
 u64 hittable_list_add(HittableList *list, Hittable hittable) {
   u64 result = list->count;
+  assert(list->count < list->size);
   if (list->count < list->size) {
     list->objects[list->count++] = hittable;
     Aabb *other_bbox = hittable_get_bounding_box(&hittable);
@@ -1467,8 +1474,8 @@ f32 linear_to_gamma(f32 linear_component) {
 }
 
 // TODO: handle fwrite return values, consider s_fopen
-void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height) {
-  FILE *img_file = fopen("image.ppm", "wb");
+void pixels_to_ppm(vec3 *pixels_colors, u32 pixels_width, u32 pixels_height, const char *img_name) {
+  FILE *img_file = fopen(img_name, "wb");
   if (img_file == NULL) {
     fprintf(stderr, "Couldn't open the file for writing\n");
     return;
@@ -1685,11 +1692,12 @@ typedef struct {
   vec3 view_up;
   f32 defocus_angle;
   vec3 background_color;
+  const char *img_name;
 } RenderSettings;
 
 static RenderSettings g_default_render_settings = 
   { 16.0f/9.0f, 1200, 100, 50, 20.0f, { 13.0f, 2.0f, 3.0f },
-    { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f, {0.7f, 0.8f, 1.0f} };
+    { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f, {0.7f, 0.8f, 1.0f}, "image.ppm" };
 
 #define CUDA_CHECK(x) do {                         \
     cudaError_t err = x;                           \
@@ -1769,14 +1777,14 @@ void init_gpu_data(PerPixelGpuData *gd, RayColorStackData *rcsd, WorldRef *hrs,
 }
 
 typedef struct {
-  HittableList all;
+  HittableList all_hittables;
   TextureList textures;
   HittableRefList bvh_include;
 } World;
 
 i32 hittable_depth(World *world, HittableRef href) {
   i32 result = 0;
-  Hittable *hittable = &world->all.objects[href];
+  Hittable *hittable = &world->all_hittables.objects[href];
   switch (hittable->type) {
     case VIS_OBJECT_SPHERE:
     case VIS_OBJECT_TRIANGLE:
@@ -1809,11 +1817,13 @@ i32 world_max_depth(World *world) {
   return result;
 }
 
-void render_w_settings(HittableList *hittables, TextureList *textures,
-    HittableRefList *world, RenderSettings *settings) {
-  WorldRef root_bvh_node = make_bvh_node_from_hittable_list(hittables, world);
+void render(World *world, RenderSettings *settings) {
+  HittableList *hittables = &world->all_hittables;
+  HittableRefList *bvh_include = &world->bvh_include;
+  TextureList *textures = &world->textures;
+  WorldRef root_bvh_node = make_bvh_node_from_hittable_list(hittables, bvh_include);
 
-  print_bvh_info(hittables->objects, world->data, root_bvh_node);
+  print_bvh_info(hittables->objects, bvh_include->data, root_bvh_node);
 
   f32 pixel_samples_scale = 1.0f / (f32)settings->samples_per_pixel;
 
@@ -1873,12 +1883,12 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   gpu_textures.arena.data = gpu_texture_data;
 
   HittableRef *gpu_hittable_refs;
-  u64 hittable_refs_size = world->count * sizeof(HittableRef);
+  u64 hittable_refs_size = bvh_include->count * sizeof(HittableRef);
   cudaMalloc(&gpu_hittable_refs, hittable_refs_size);
-  cudaMemcpy(gpu_hittable_refs, world->data, hittable_refs_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(gpu_hittable_refs, bvh_include->data, hittable_refs_size, cudaMemcpyHostToDevice);
 
-  HittableRefList gpu_world = *world;
-  gpu_world.data = gpu_hittable_refs;
+  HittableRefList gpu_bvh_include = *bvh_include;
+  gpu_bvh_include.data = gpu_hittable_refs;
 
   i32 block_size = 256;
   i32 num_blocks = (n + block_size - 1) / block_size;
@@ -1886,17 +1896,16 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
   SceneData sd = {0};
   sd.hittables = gpu_hittables;
   sd.textures = gpu_textures;
-  sd.world = gpu_world;
+  sd.world = gpu_bvh_include;
   sd.root_bvh_node = root_bvh_node;
 
   SceneData *gpu_sd;
   cudaMalloc(&gpu_sd, sizeof(SceneData));
   cudaMemcpy(gpu_sd, &sd, sizeof(SceneData), cudaMemcpyHostToDevice);
 
-  u64 max_bvh_depth = logf(world->count) / logf(2.0f) + 1;
-  World tmp = { *hittables, *textures, *world };
+  u64 max_bvh_depth = logf(bvh_include->count) / logf(2.0f) + 1;
   // NOTE: take into account y_rotation, translation and hittable_structure hit calls
-  max_bvh_depth += world_max_depth(&tmp);
+  max_bvh_depth += world_max_depth(world);
 
   PerPixelGpuData *gd;
   cudaMalloc(&gd, n * sizeof(PerPixelGpuData));
@@ -1933,86 +1942,230 @@ void render_w_settings(HittableList *hittables, TextureList *textures,
 
   vec3 *cpu_pixels_colors = (vec3 *)malloc(n * sizeof(vec3));
   cudaMemcpy(cpu_pixels_colors, pixels_colors, n * sizeof(vec3), cudaMemcpyDeviceToHost);
-  pixels_to_ppm(cpu_pixels_colors, img_width, img_height);
-}
-
-void render(HittableList *hittables, TextureList *textures, HittableRefList *world) {
-  render_w_settings(hittables, textures, world, &g_default_render_settings);
+  pixels_to_ppm(cpu_pixels_colors, img_width, img_height, settings->img_name);
 }
 
 inline
-WorldRef world_add(HittableList *hittables, HittableRefList *world, Hittable hittable) {
-  return hittable_ref_list_add(world, hittable_list_add(hittables, hittable));
+WorldRef world_add(World *world, Hittable hittable) {
+  return hittable_ref_list_add(&world->bvh_include,
+      hittable_list_add(&world->all_hittables, hittable));
 }
 
 inline
-WorldRef world_add_rotated(HittableList *hittables, HittableRefList *world, Hittable hittable, f32 angle) {
-  return world_add(hittables,
-      world,
-      make_hittable_y_rotation(hittables, hittable_list_add(hittables, hittable), angle));
+WorldRef world_add_rotated(World *world, Hittable hittable, f32 angle) {
+  return world_add(world,
+      make_hittable_y_rotation(&world->all_hittables,
+        hittable_list_add(&world->all_hittables, hittable), angle));
 }
 
 inline
-WorldRef world_add_translated(HittableList *hittables, HittableRefList *world,
-    Hittable hittable, vec3 offset) {
-  return world_add(hittables,
-      world,
-      make_hittable_translation(hittables, hittable_list_add(hittables, hittable), offset));
+WorldRef world_add_translated(World *world, Hittable hittable, vec3 offset) {
+  return world_add(world,
+      make_hittable_translation(&world->all_hittables,
+        hittable_list_add(&world->all_hittables, hittable), offset));
 }
 
 inline
-WorldRef world_add_rotated_translated(HittableList *hittables, HittableRefList *world,
-    Hittable hittable, f32 angle, vec3 offset) {
-  HittableRef ref = hittable_list_add(hittables,hittable);
-  ref = hittable_list_add(hittables, make_hittable_y_rotation(hittables, ref, angle));
-  ref = hittable_list_add(hittables,
-      make_hittable_translation(hittables, ref, offset));
-  return hittable_ref_list_add(world, ref);
+WorldRef world_add_rotated_translated(World *world, Hittable hittable, f32 angle, vec3 offset) {
+  HittableRef ref = hittable_list_add(&world->all_hittables, hittable);
+  ref = hittable_list_add(&world->all_hittables, 
+      make_hittable_y_rotation(&world->all_hittables, ref, angle));
+  ref = hittable_list_add(&world->all_hittables,
+      make_hittable_translation(&world->all_hittables, ref, offset));
+  return hittable_ref_list_add(&world->bvh_include, ref);
 }
 
-void bouncing_spheres_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(5));
-  TextureList textures = make_texture_list(&texture_arena);
+inline Material add_mat_lamb_sc(World *world, vec3 color) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  result.lambertian_texture = 
+    texture_list_add(&world->textures, make_solid_color_texture(color));
+  return result;
+}
 
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+inline Material add_mat_light_sc(World *world, vec3 color) {
+  Material result = {0};
+  result.type = MATERIAL_DIFFUSE_LIGHT;
+  result.diffuse_light_texture = 
+    texture_list_add(&world->textures, make_solid_color_texture(color));
+  return result;
+}
 
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
+inline Material add_mat_lamb_img(World *world, const char *file_name) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  result.lambertian_texture =
+    texture_list_add(&world->textures, make_image_texture(file_name));
+  return result;
+}
 
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
+inline Material add_mat_lamb_noise(World *world, f32 scale) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  PerlinNoise noise = make_perlin_noise();
+  result.lambertian_texture =
+    texture_list_add(&world->textures, make_noise_texture(&noise, scale));
+  return result;
+}
 
-  Material default_mat = 
-    make_lambertian(texture_list_add(&textures, make_solid_color_texture(Vec3(0.5f, 0.5f, 0.5f))));
+inline Material add_mat_metal(World *world, vec3 albedo, f32 fuzziness) {
+  return make_metal(albedo, fuzziness);
+}
 
-  TextureRef color_even = texture_list_add(&textures,
-      make_solid_color_texture(Vec3(0.2f, 0.3f, 0.1f)));
-  TextureRef color_odd = texture_list_add(&textures,
-      make_solid_color_texture(Vec3(0.9f, 0.9f, 0.9f)));
-  TextureRef checker_texture = texture_list_add(&textures,
-      make_checker_texture(0.32f, color_even, color_odd));
+inline Material add_mat_dielectric(World *world, f32 refraction_index) {
+  return make_dielectric(refraction_index);
+}
 
-  Material material_ground = make_lambertian(checker_texture);
-  Hittable ground = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, -1000.0f, 0.0f), 1000.0f, material_ground) };
-  hittable_ref_list_add(&world, hittable_list_add(&hittables, ground));
+inline Material add_mat_lamb_checker_sc_sc(World *world, f32 scale, vec3 color_even, vec3 color_odd) {
+  Material result = {0};
+  result.type = MATERIAL_LAMBERTIAN;
+  TextureRef ref_even = texture_list_add(&world->textures, make_solid_color_texture(color_even));
+  TextureRef ref_odd = texture_list_add(&world->textures, make_solid_color_texture(color_odd));
+  result.lambertian_texture =
+    texture_list_add(&world->textures, make_checker_texture(scale, ref_even, ref_odd));
+  return result;
+}
+
+inline WorldRef add_quad(World *world, vec3 q, vec3 u, vec3 v, Material mat) {
+   WorldRef result = world_add(world, make_hittable_quad(q, u, v, mat));
+   return result;
+}
+
+inline WorldRef add_box(World *world, vec3 a, vec3 b, Material mat) {
+   WorldRef result = world_add(world, make_box(&world->all_hittables, a, b, mat));
+   return result;
+}
+
+inline WorldRef add_sphere(World *world, vec3 center, f32 radius, Material mat) {
+  WorldRef result = world_add(world, make_hittable_sphere(center, radius, mat));
+  return result;
+}
+
+inline WorldRef add_mov_sphere(World *world, vec3 center, vec3 destination, f32 radius, Material mat) {
+  WorldRef result = world_add(world, make_hittable_moving_sphere(center, destination, radius, mat));
+  return result;
+}
+
+inline WorldRef add_pyramid(World *world, vec3 base_a, vec3 base_b, vec3 tip, Material mat) {
+  WorldRef result = world_add(world, make_pyramid(&world->all_hittables, base_a, base_b, tip, mat));
+  return result;
+}
+
+inline WorldRef add_trans_quad(World *world, vec3 offset, vec3 q, vec3 u, vec3 v, Material mat) {
+   WorldRef result = world_add_translated(world, make_hittable_quad(q, u, v, mat), offset);
+   return result;
+}
+
+inline WorldRef add_trans_box(World *world, vec3 offset, vec3 a, vec3 b, Material mat) {
+   WorldRef result = world_add_translated(world, make_box(&world->all_hittables, a, b, mat), offset);
+   return result;
+}
+
+inline WorldRef add_trans_sphere(World *world, vec3 offset, vec3 center, f32 radius, Material mat) {
+  WorldRef result = world_add_translated(world, make_hittable_sphere(center, radius, mat), offset);
+  return result;
+}
+
+inline WorldRef add_trans_mov_sphere(World *world, vec3 offset, 
+    vec3 center, vec3 destination, f32 radius, Material mat) {
+  WorldRef result =
+    world_add_translated(world, make_hittable_moving_sphere(center, destination, radius, mat), offset);
+  return result;
+}
+
+inline WorldRef add_trans_pyramid(World *world, vec3 offset,
+    vec3 base_a, vec3 base_b, vec3 tip, Material mat) {
+  WorldRef result =
+    world_add_translated(world, make_pyramid(&world->all_hittables, base_a, base_b, tip, mat), offset);
+  return result;
+}
+
+inline WorldRef add_yrot_quad(World *world, f32 angle, vec3 q, vec3 u, vec3 v, Material mat) {
+   WorldRef result = world_add_rotated(world, make_hittable_quad(q, u, v, mat), angle);
+   return result;
+}
+
+inline WorldRef add_yrot_box(World *world, f32 angle, vec3 a, vec3 b, Material mat) {
+   WorldRef result = world_add_rotated(world, make_box(&world->all_hittables, a, b, mat), angle);
+   return result;
+}
+
+inline WorldRef add_yrot_sphere(World *world, f32 angle, vec3 center, f32 radius, Material mat) {
+  WorldRef result = world_add_rotated(world, make_hittable_sphere(center, radius, mat), angle);
+  return result;
+}
+
+inline WorldRef add_yrot_mov_sphere(World *world, f32 angle, 
+    vec3 center, vec3 destination, f32 radius, Material mat) {
+  WorldRef result =
+    world_add_rotated(world, make_hittable_moving_sphere(center, destination, radius, mat), angle);
+  return result;
+}
+
+inline WorldRef add_yrot_pyramid(World *world, f32 angle,
+    vec3 base_a, vec3 base_b, vec3 tip, Material mat) {
+  WorldRef result =
+    world_add_rotated(world, make_pyramid(&world->all_hittables, base_a, base_b, tip, mat), angle);
+  return result;
+}
+
+inline WorldRef add_yrot_trans_quad(World *world, f32 angle, vec3 offset,
+    vec3 q, vec3 u, vec3 v, Material mat) {
+   WorldRef result = world_add_rotated_translated(world, make_hittable_quad(q, u, v, mat), angle, offset);
+   return result;
+}
+
+inline WorldRef add_yrot_trans_box(World *world, f32 angle, vec3 offset,
+    vec3 a, vec3 b, Material mat) {
+   WorldRef result =
+     world_add_rotated_translated(world, make_box(&world->all_hittables, a, b, mat), angle, offset);
+   return result;
+}
+
+inline WorldRef add_yrot_trans_sphere(World *world, f32 angle, vec3 offset,
+    vec3 center, f32 radius, Material mat) {
+  WorldRef result =
+    world_add_rotated_translated(world, make_hittable_sphere(center, radius, mat), angle, offset);
+  return result;
+}
+
+inline WorldRef add_yrot_trans_mov_sphere(World *world, f32 angle, vec3 offset,
+    vec3 center, vec3 destination, f32 radius, Material mat) {
+  WorldRef result =
+    world_add_rotated_translated(world, 
+        make_hittable_moving_sphere(center, destination, radius, mat),
+        angle,
+        offset);
+  return result;
+}
+
+inline WorldRef add_yrot_trans_pyramid(World *world, f32 angle, vec3 offset,
+    vec3 base_a, vec3 base_b, vec3 tip, Material mat) {
+  WorldRef result =
+    world_add_rotated_translated(world, 
+        make_pyramid(&world->all_hittables, base_a, base_b, tip, mat),
+        angle,
+        offset);
+  return result;
+}
+
+void bouncing_spheres_scene(World *world, RenderSettings *settings) {
+  Material default_mat = add_mat_lamb_sc(world, Vec3(0.5, 0.5, 0.5));
+
+  Material ground_mat = add_mat_lamb_checker_sc_sc(world, 0.32, Vec3(0.2, 0.3, 0.1), Vec3(0.9, 0.9, 0.9));
+  add_sphere(world, Vec3(0,-1000,0), 1000, ground_mat);
 
   for (i32 a = -11; a < 11; ++a) {
     for (i32 b = -11; b < 11; ++b) {
       f32 material_choice = random_f32();
       vec3 center = { a + 0.9f*random_f32(), 0.2f, b + 0.9f*random_f32() };
-
       if (vec3_length(vec3_sub(center, Vec3(4.0f, 0.2f, 0.0f))) > 0.9f) {
         Material current_material;
         if (material_choice < 0.8f) {
           vec3 albedo = vec3_comp_scale(vec3_random(), vec3_random());
-          current_material = make_lambertian(texture_list_add(&textures, make_solid_color_texture(albedo)));
+          current_material = add_mat_lamb_sc(world, albedo);
           vec3 sphere_direction = Vec3(0.0f, random_f32_bound(0.0f, 0.5f), 0.0f);
-          Hittable obj = { VIS_OBJECT_SPHERE, 
-            make_moving_sphere(center, sphere_direction, 0.2f, current_material) };
-          hittable_ref_list_add(&world, hittable_list_add(&hittables, obj));
+          add_mov_sphere(world, center, sphere_direction, 0.2, current_material);
         } else {
           if (material_choice < 0.95f) {
             vec3 albedo = vec3_random_bound(0.5f, 1.0f);
@@ -2021,335 +2174,163 @@ void bouncing_spheres_scene() {
           } else {
             current_material = make_dielectric(1.5f);
           }
-          Hittable obj = { VIS_OBJECT_SPHERE, make_sphere(center, 0.2f, current_material) };
-          hittable_ref_list_add(&world, hittable_list_add(&hittables, obj));
+          add_sphere(world, center, 0.2, current_material);
         }
       }
     }
   }
 
-  Material mat1 = make_dielectric(1.5f);
-  Hittable big_sphere1 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(0.0f, 1.0f, 0.0f), 1.0f, mat1) };
-  hittable_ref_list_add(&world, hittable_list_add(&hittables, big_sphere1));
+  Material mat1 = add_mat_dielectric(world, 1.5f);
+  add_sphere(world, Vec3(0, 1, 0), 1, mat1);
 
-  Material mat2 = make_lambertian(texture_list_add(&textures, make_solid_color_texture(Vec3(0.4f, 0.2f, 0.1f))));
-  Hittable big_sphere2 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(-4.0f, 1.0f, 0.0f), 1.0f, mat2) };
-  hittable_ref_list_add(&world, hittable_list_add(&hittables, big_sphere2));
+  Material mat2 = add_mat_lamb_sc(world, Vec3(0.4, 0.2, 0.1));
+  add_sphere(world, Vec3(-4, 1, 0), 1, mat2);
 
-  Material mat3 = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.0f);
-  Hittable big_sphere3 = { VIS_OBJECT_SPHERE, make_sphere(Vec3(4.0f, 1.0f, 0.0f), 1.0f, mat3) };
-  hittable_ref_list_add(&world, hittable_list_add(&hittables, big_sphere3));
+  Material mat3 = add_mat_metal(world, Vec3(0.7f, 0.6f, 0.5f), 0.0f);
+  add_sphere(world, Vec3(4, 1, 0), 1, mat3);
 
-  render(&hittables, &textures, &world);
+  *settings = g_default_render_settings;
 }
 
-void checkered_spheres_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(5));
-  TextureList textures = make_texture_list(&texture_arena);
+void checkered_spheres_scene(World *world, RenderSettings *settings) {
+  Material checker_mat =
+    add_mat_lamb_checker_sc_sc(world, 0.32, Vec3(0.2, 0.3, 0.1), Vec3(0.9, 0.9, 0.9));
 
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+  add_sphere(world, Vec3(0, -10, 0), 10, checker_mat);
+  add_sphere(world, Vec3(0, 10, 0), 10, checker_mat);
 
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
-
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
-
-  TextureRef color_even = texture_list_add(&textures,
-      make_solid_color_texture(Color(0.2f, 0.3f, 0.1f)));
-  TextureRef color_odd = texture_list_add(&textures, 
-      make_solid_color_texture(Color(0.9f, 0.9f, 0.9f)));
-  TextureRef checker_texture = texture_list_add(&textures,
-      make_checker_texture(0.32f, color_even, color_odd));
-
-  Hittable sphere1 = make_hittable_sphere(Vec3(0.0f, -10.0f, 0.0f), 10.0f, make_lambertian(checker_texture));
-  Hittable sphere2 = make_hittable_sphere(Vec3(0.0f, 10.0f, 0.0f), 10.0f, make_lambertian(checker_texture));
-
-  hittable_ref_list_add(&world, hittable_list_add(&hittables, sphere1));
-  hittable_ref_list_add(&world, hittable_list_add(&hittables, sphere2));
-
-  RenderSettings settings = {0};
-  settings.img_ratio = 16.0f / 9.0f;
-  settings.img_width = 400;
-  settings.samples_per_pixel = 100;
-  settings.max_bounces = 50;
-  settings.vfov = 20.0f;
-  settings.lookfrom = Vec3(13.0f, 2.0f, 3.0f);
-  settings.lookat = Vec3(0.0f, 0.0f, 0.0f);
-  settings.view_up = Vec3(0.0f, 0.1f, 0.0f);
-  settings.defocus_angle = 0.0f;
-  settings.background_color = Vec3(0.7f, 0.8f, 1.0f);
-
-  render_w_settings(&hittables, &textures, &world, &settings);
+  settings->img_ratio = 16.0f / 9.0f;
+  settings->img_width = 400;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 50;
+  settings->vfov = 20.0f;
+  settings->lookfrom = Vec3(13.0f, 2.0f, 3.0f);
+  settings->lookat = Vec3(0.0f, 0.0f, 0.0f);
+  settings->view_up = Vec3(0.0f, 0.1f, 0.0f);
+  settings->defocus_angle = 0.0f;
+  settings->background_color = Vec3(0.7f, 0.8f, 1.0f);
+  settings->img_name = "checkered_spheres.ppm";
 }
 
-void earth_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(10));
-  TextureList textures = make_texture_list(&texture_arena);
+void earth_scene(World *world, RenderSettings *settings) {
+  Material earth_mat = add_mat_lamb_img(world, "earthmap.jpg");
+  add_sphere(world, Vec3(0,0,0), 2, earth_mat);
 
-  TextureRef earth_texture = texture_list_add(&textures, make_image_texture("earthmap.jpg"));
-  Material earth_surface = make_lambertian(earth_texture);
-
-  Hittable globe = make_hittable_sphere(Vec3(0,0,0), 2.0f, earth_surface);
-
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
-
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
-
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
-
-  world_add_rotated(&hittables, &world, globe, 15);
-
-  RenderSettings settings = g_default_render_settings;
-  settings.img_width = 400;
-  settings.samples_per_pixel = 100;
-  settings.lookfrom = Vec3(0, 0, 12);
-  settings.lookat = Vec3(0, 0, 0);
-  settings.defocus_angle = 0;
-
-  render_w_settings(&hittables, &textures, &world, &settings);
+  settings->img_width = 400;
+  settings->samples_per_pixel = 100;
+  settings->lookfrom = Vec3(0, 0, 12);
+  settings->lookat = Vec3(0, 0, 0);
+  settings->defocus_angle = 0;
+  settings->img_name = "earth.ppm";
 }
 
-void perlin_spheres_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(5));
-  TextureList textures = make_texture_list(&texture_arena);
+void perlin_spheres_scene(World *world, RenderSettings *settings) {
+  Material noise_mat = add_mat_lamb_noise(world, 4);
+  add_sphere(world, Vec3(0,-1000,0), 1000, noise_mat);
+  add_sphere(world, Vec3(0,2,0), 2, noise_mat);
 
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
-
-  PerlinNoise noise = make_perlin_noise();
-  TextureRef noise_tex = texture_list_add(&textures, make_noise_texture(&noise, 4));
-  Hittable ground = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(noise_tex));
-  Hittable sphere = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(noise_tex));
-
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
-
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
-
-  world_add(&hittables, &world, ground);
-  world_add(&hittables, &world, sphere);
-
-  RenderSettings settings = g_default_render_settings;
-  settings.img_width = 400;
-  settings.samples_per_pixel = 100;
-  settings.lookfrom = Vec3(13, 2, 3);
-  settings.lookat = Vec3(0, 0, 0);
-  settings.defocus_angle = 0;
-
-  render_w_settings(&hittables, &textures, &world, &settings);
+  settings->img_width = 400;
+  settings->samples_per_pixel = 100;
+  settings->lookfrom = Vec3(13, 2, 3);
+  settings->lookat = Vec3(0, 0, 0);
+  settings->defocus_angle = 0;
+  settings->img_name = "perlin_spheres.ppm";
 }
 
-/*
-void quads_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, sizeof(Texture) * 10);
-  
-  Hittable left_quad = make_hittable_quad(Vec3(-3,-2, 5), Vec3(0, 0,-4), Vec3(0, 4, 0), 
-      make_lambertian_solid_color(&texture_arena, Vec3(1.0f, 0.2f, 0.2f)));
-  Hittable back_quad = make_hittable_quad(Vec3(-2,-2, 0), Vec3(4, 0, 0), Vec3(0, 4, 0),
-      make_lambertian_solid_color(&texture_arena, Vec3(0.2f, 1.0f, 0.2f)));
-  Hittable right_quad = make_hittable_quad(Vec3(3,-2, 1), Vec3(0, 0, 4), Vec3(0, 4, 0),
-      make_lambertian_solid_color(&texture_arena, Vec3(0.2f, 0.2f, 1.0f)));
-  Hittable upper_quad = make_hittable_quad(Vec3(-2, 3, 1), Vec3(4, 0, 0), Vec3(0, 0, 4),
-      make_lambertian_solid_color(&texture_arena, Vec3(1.0f, 0.5f, 0.0f)));
-  Hittable lower_quad = make_hittable_quad(Vec3(-2,-3, 5), Vec3(4, 0, 0), Vec3(0, 0,-4),
-      make_lambertian_solid_color(&texture_arena, Vec3(0.2f, 0.8f, 0.8f)));
+void quads_scene(World *world, RenderSettings *settings) {
+  Material left_mat = add_mat_lamb_sc(world, Vec3(1.0f, 0.2f, 0.2f));
+  Material back_mat = add_mat_lamb_sc(world, Vec3(0.2f, 1.0f, 0.2f));
+  Material right_mat = add_mat_lamb_sc(world, Vec3(0.2f, 0.2f, 1.0f));
+  Material upper_mat = add_mat_lamb_sc(world, Vec3(1.0f, 0.5f, 0.0f));
+  Material lower_mat = add_mat_lamb_sc(world, Vec3(0.2f, 0.8f, 0.8f));
 
-  Hittable hittables[WORLD_SIZE]; // remember about the merge sort copy
+  add_quad(world, Vec3(-3,-2, 5), Vec3(0, 0,-4), Vec3(0, 4, 0), left_mat);
+  add_quad(world, Vec3(-2,-2, 0), Vec3(4, 0, 0), Vec3(0, 4, 0), back_mat);
+  add_quad(world, Vec3(3,-2, 1), Vec3(0, 0, 4), Vec3(0, 4, 0), right_mat);
+  add_quad(world, Vec3(-2, 3, 1), Vec3(4, 0, 0), Vec3(0, 0, 4), upper_mat);
+  add_quad(world, Vec3(-2,-3, 5), Vec3(4, 0, 0), Vec3(0, 0,-4), lower_mat);
 
-  HittableList world = {0};
-  world.objects = hittables;
-  world.size = WORLD_SIZE;
-  hittable_list_add(&world, left_quad);
-  hittable_list_add(&world, back_quad);
-  hittable_list_add(&world, right_quad);
-  hittable_list_add(&world, upper_quad);
-  hittable_list_add(&world, lower_quad);
-
-  RenderSettings settings = {0};
-  settings.img_ratio = 1.0f;
-  settings.img_width = 400;
-  settings.samples_per_pixel = 100;
-  settings.max_bounces = 50;
-  settings.vfov = 80;
-  settings.lookfrom = Vec3(0, 0, 9);
-  settings.lookat = Vec3(0, 0, 0);
-  settings.view_up = Vec3(0, 1, 0);
-  settings.defocus_angle = 0;
-  settings.background_color = Vec3(0.7f, 0.8f, 1.0f);
-
-  render_w_settings(&world, &settings);
-}
-*/
-
-void simple_light_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(5));
-  TextureList textures = make_texture_list(&texture_arena);
-
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
-
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
-
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
-
-  PerlinNoise noise = make_perlin_noise();
-  TextureRef noise_tex = texture_list_add(&textures, make_noise_texture(&noise, 4));
-  Hittable sphere1 = make_hittable_sphere(Vec3(0, -1000, 0), 1000, make_lambertian(noise_tex));
-  Hittable sphere2 = make_hittable_sphere(Vec3(0, 2, 0), 2, make_lambertian(noise_tex));
-
-  TextureRef sc = texture_list_add(&textures, make_solid_color_texture(Vec3(4, 4, 4)));
-  Hittable light_quad =
-    make_hittable_quad(Vec3(3, 1, -2), Vec3(2, 0, 0), Vec3(0, 2, 0), make_diffuse_light(sc));
-  Hittable light_sphere = make_hittable_sphere(Vec3(0, 7, 0), 2, make_diffuse_light(sc));
-
-  world_add(&hittables, &world, sphere1);
-  world_add(&hittables, &world, sphere2);
-  world_add(&hittables, &world, light_quad);
-  world_add(&hittables, &world, light_sphere);
-
-  RenderSettings settings = {0};
-  settings.img_ratio = 16.0f / 9.0f;
-  settings.img_width = 1080;
-  settings.samples_per_pixel = 1000;
-  settings.max_bounces = 50;
-  settings.vfov = 20;
-  settings.lookfrom = Vec3(26, 3, 6);
-  settings.lookat = Vec3(0, 2, 0);
-  settings.view_up = Vec3(0, 1, 0);
-
-  render_w_settings(&hittables, &textures, &world, &settings);
+  settings->img_ratio = 1.0f;
+  settings->img_width = 400;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 50;
+  settings->vfov = 80;
+  settings->lookfrom = Vec3(0, 0, 9);
+  settings->lookat = Vec3(0, 0, 0);
+  settings->view_up = Vec3(0, 1, 0);
+  settings->defocus_angle = 0;
+  settings->background_color = Vec3(0.7f, 0.8f, 1.0f);
+  settings->img_name = "quads.ppm";
 }
 
-void cornell_box_scene() {
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(5));
-  TextureList textures = make_texture_list(&texture_arena);
+void simple_light_scene(World *world, RenderSettings *settings) {
+  Material noise_mat = add_mat_lamb_noise(world, 4);
+  add_sphere(world, Vec3(0, -1000, 0), 1000, noise_mat);
+  add_sphere(world, Vec3(0, 2, 0), 2, noise_mat);
 
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList world = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+  Material light_mat = add_mat_light_sc(world, Vec3(4,4,4));
+  add_quad(world, Vec3(3,1,-2), Vec3(2,0,0), Vec3(0,2,0), light_mat);
+  add_sphere(world, Vec3(0,7,0), 2, light_mat);
 
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
+  settings->img_ratio = 16.0f / 9.0f;
+  settings->img_width = 1080;
+  settings->samples_per_pixel = 1000;
+  settings->max_bounces = 50;
+  settings->vfov = 20;
+  settings->lookfrom = Vec3(26, 3, 6);
+  settings->lookat = Vec3(0, 2, 0);
+  settings->view_up = Vec3(0, 1, 0);
+  settings->img_name = "simple_light.ppm";
+}
 
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
+void cornell_box_scene(World *world, RenderSettings *settings) {
+  Material red = add_mat_lamb_sc(world, Vec3(0.65, 0.05, 0.05));
+  Material white = add_mat_lamb_sc(world, Vec3(0.73, 0.73, 0.73));
+  Material green = add_mat_lamb_sc(world, Vec3(0.12, 0.45, 0.15));
+  Material light = add_mat_light_sc(world, Vec3(15, 15, 15));
 
-  Material red = make_lambertian(texture_list_add(&textures,
-        make_solid_color_texture(Vec3(0.65f, 0.05f, 0.05f))));
-  Material white = make_lambertian(texture_list_add(&textures,
-      make_solid_color_texture(Vec3(0.73f, 0.73f, 0.73f))));
-  Material green = make_lambertian(texture_list_add(&textures,
-      make_solid_color_texture(Vec3(0.12f, 0.45f, 0.15f))));
-  TextureRef light_col = texture_list_add(&textures, make_solid_color_texture(Vec3(15, 15, 15)));
-  Material light = make_diffuse_light(light_col);
-
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, 
-          make_hittable_quad(Vec3(555,0,0), Vec3(0,555,0), Vec3(0,0,555), green)));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, 
-          make_hittable_quad(Vec3(0,0,0), Vec3(0,555,0), Vec3(0,0,555), red)));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, 
-          make_hittable_quad(Vec3(343, 554, 332), Vec3(-130,0,0), Vec3(0,0,-105), light)));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, 
-          make_hittable_quad(Vec3(0,0,0), Vec3(555,0,0), Vec3(0,0,555), white)));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, 
-          make_hittable_quad(Vec3(555,555,555), Vec3(-555,0,0), Vec3(0,0,-555), white)));
-  hittable_ref_list_add(&world,
-        hittable_list_add(&hittables, 
-          make_hittable_quad(Vec3(0,0,555), Vec3(555,0,0), Vec3(0,555,0), white)));
+  add_quad(world, Vec3(555,0,0),       Vec3(0,555,0),  Vec3(0,0,555),  green);
+  add_quad(world, Vec3(0,0,0),         Vec3(0,555,0),  Vec3(0,0,555),  red);
+  add_quad(world, Vec3(343, 554, 332), Vec3(-130,0,0), Vec3(0,0,-105), light);
+  add_quad(world, Vec3(0,0,0),         Vec3(555,0,0),  Vec3(0,0,555),  white);
+  add_quad(world, Vec3(555,555,555),   Vec3(-555,0,0), Vec3(0,0,-555), white);
+  add_quad(world, Vec3(0,0,555),       Vec3(555,0,0),  Vec3(0,555,0),  white);
 
 #if 1
-  Material metal = make_metal(Vec3(0.7f, 0.6f, 0.5f), 0.6f);
-  world_add_rotated_translated(&hittables, 
-      &world, 
-      make_pyramid(&hittables, Vec3(0, 0, 0), Vec3(160, 0, 160), Vec3(100,400,100), red), 
-      60,
-      Vec3(200, 0, 150));
-
+  Material metal = add_mat_metal(world, Vec3(0.7f, 0.6f, 0.5f), 0.6f);
+  add_yrot_trans_pyramid(world, 60, Vec3(200, 0, 150),
+      Vec3(0, 0, 0), Vec3(160, 0, 160), Vec3(100,400,100), metal);
 #else
-  // BUG?: wall doesn't render without sorting when creating bvh
-  world_add_translated(&hittables, 
-      &world, 
-      make_hittable_quad(Vec3(0, 0, 0), Vec3(100, 0, 0), Vec3(50, 50, 50), green), 
-      Vec3(500, 200, 100));
-
-  world_add_translated(&hittables, 
-      &world, 
-      make_hittable_quad(Vec3(0, 0, 0), Vec3(100, 0, 0), Vec3(50, 50, 50), green), 
-      Vec3(100, 200, 100));
-
-  world_add_translated(&hittables, 
-      &world, 
-      make_hittable_quad(Vec3(0, 0, 0), Vec3(100, 0, 0), Vec3(50, 50, 50), green), 
-      Vec3(0, 200, 100));
+  add_trans_quad(world, Vec3(500, 200, 100), Vec3(0,0,0), Vec3(100,0,0), Vec3(50,50,50), green);
+  add_trans_quad(world, Vec3(100,200,100), Vec3(0,0,0), Vec3(100,0,0), Vec3(50,50,50), green);
+  add_trans_quad(world, Vec3(0,200,100), Vec3(0,0,0), Vec3(100,0,0), Vec3(50,50,50), green);
 #endif
 
 #if 0
-  HittableRef box1 = hittable_list_add(&hittables,
-      make_box(&hittables, Vec3(130, 0, 65), Vec3(295, 165, 230), white));
-  //box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
-  hittable_ref_list_add(&world, box1);
+  add_box(world, Vec3(130,0,65), Vec3(295,165,230), white);
 #else
-  HittableRef box1 = hittable_list_add(&hittables,
-      make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 330, 165), white));
-  box1 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box1, 15));
-  box1 = hittable_list_add(&hittables,
-      make_hittable_translation(&hittables, box1, Vec3(265, 0, 295)));
-  hittable_ref_list_add(&world, box1);
+  add_yrot_trans_box(world, 15, Vec3(265, 0, 295), Vec3(0, 0, 0), Vec3(165, 330, 165), white);
 #endif
 
 #if 0
-  HittableRef box2 = hittable_list_add(&hittables,
-      make_box(&hittables, Vec3(265, 0, 295), Vec3(430, 330, 460), white));
-  //box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
-  hittable_ref_list_add(&world, box2);
+  add_box(world, Vec3(265,0,295), Vec3(430,330,460), white);
 #else
-  HittableRef box2 = hittable_list_add(&hittables,
-      make_box(&hittables, Vec3(0, 0, 0), Vec3(165, 165, 165), white));
-  box2 = hittable_list_add(&hittables, make_hittable_y_rotation(&hittables, box2, -18));
-  box2 = hittable_list_add(&hittables,
-      make_hittable_translation(&hittables, box2, Vec3(130, 0, -10)));
-  hittable_ref_list_add(&world, box2);
+  add_yrot_trans_box(world, -18, Vec3(130, 0, 100), Vec3(0, 0, 0), Vec3(165, 165, 165), white);
 #endif
 
-  RenderSettings settings = {0};
-  settings.img_ratio = 1.0f;
-  settings.img_width = 600;
-  settings.samples_per_pixel = 2000;
-  settings.max_bounces = 50;
-  settings.vfov = 40;
-  settings.lookfrom = Vec3(278, 278, -800);
-  settings.lookat = Vec3(278, 278, 0);
-  settings.view_up = Vec3(0, 1, 0);
-  settings.defocus_angle = 0;
-
-  render_w_settings(&hittables, &textures, &world, &settings);
+  settings->img_ratio = 1.0f;
+  settings->img_width = 600;
+  settings->samples_per_pixel = 200;
+  settings->max_bounces = 50;
+  settings->vfov = 40;
+  settings->lookfrom = Vec3(278, 278, -800);
+  settings->lookat = Vec3(278, 278, 0);
+  settings->view_up = Vec3(0, 1, 0);
+  settings->defocus_angle = 0;
+  settings->img_name = "cornell_box.ppm";
 }
 
-#if 0
-void final_scene(World *world) {
+void final_scene(World *world, RenderSettings *settings) {
   Material ground_mat = add_mat_lamb_sc(world, Vec3(0.48f, 0.83f, 0.53f));
 
   i32 boxes_per_side = 20;
@@ -2370,41 +2351,58 @@ void final_scene(World *world) {
   Material light = add_mat_light_sc(world, Vec3(7, 7, 7));
   add_quad(world, Vec3(123, 554, 147), Vec3(300, 0, 0), Vec3(0, 0, 265), light);
 
-  vec3 center1 = { 400, 400, 200 };
-  vec3 center2 = vec3_add(center1, Vec3(30, 0, 0));
+  vec3 center = { 400, 400, 200 };
+  vec3 direction = Vec3(30, 0, 0);
   Material sphere_mat = add_mat_lamb_sc(world, Vec3(0.7f, 0.3f, 0.1f));
-  add_mov_sphere(world, center1, center2, 50, sphere_mat);
+  add_mov_sphere(world, center, direction, 50, sphere_mat);
 
-  add_sphere(world, Vec3(260, 140, 45), 40, add_mat_dielectric(world, 1.5f));
-  add_sphere(world, Vec3(0, 150, 145), 50, add_mat_metal_sc(world, Vec3(0.8f, 0.8f, 0.9f), 1.0f));
+  add_sphere(world, Vec3(260, 150, 45), 50, add_mat_dielectric(world, 1.5f));
+  add_sphere(world, Vec3(0, 150, 145), 50, add_mat_metal(world, Vec3(0.8f, 0.8f, 0.9f), 1.0f));
 
-  Material earth_mat = add_mat_img("earthmap.jpg");
+  Material earth_mat = add_mat_lamb_img(world, "earthmap.jpg");
   add_sphere(world, Vec3(400, 200, 400), 100, earth_mat);
   Material perlin_noise = add_mat_lamb_noise(world, 0.2f);
+  add_sphere(world, Vec3(220, 280, 300), 80, perlin_noise);
 
   Material white = add_mat_lamb_sc(world, Vec3(0.73f, 0.73f, 0.73f));
   i32 ns = 1000;
   for (i32 i = 0; i < ns; ++i) {
-    add_sphere(vec3_random_bound(0, 165), 10, white);
+    add_yrot_trans_sphere(world, 15, Vec3(-100, 270, 395), vec3_random_bound(0, 165), 10, white);
   }
 
-  RenderSettings settings = {0};
-  settings.img_ratio = 1.0f;
-  settings.img_width = 400;
-  settings.samples_per_pixel = 100;
-  settings.max_bounces = 50;
-  settings.vfov = 40.0f;
-  settings.lookfrom = Vec3(478, 278, -600);
-  settings.lookat = Vec3(278, 278, 0);
-  settings.view_up = Vec3(0.0f, 0.1f, 0.0f);
-  settings.defocus_angle = 0.0f;
-  
-  render(world, settings);
+  settings->img_ratio = 1.0f;
+  settings->img_width = 800;
+  settings->samples_per_pixel = 10000;
+  settings->max_bounces = 40;
+  settings->vfov = 40.0f;
+  settings->lookfrom = Vec3(478, 278, -600);
+  settings->lookat = Vec3(278, 278, 0);
+  settings->view_up = Vec3(0.0f, 0.1f, 0.0f);
+  settings->defocus_angle = 0.0f;
+  settings->img_name = "feature_test.ppm";
 }
-#endif
+
+#define SCENE(x) x(&world, &settings)
 
 i32 main() {
   // vec3_to_unit_vec_test();
+
+  MemArena texture_arena = {0};
+  mem_arena_alloc(&texture_arena, MB(10));
+  TextureList textures = make_texture_list(&texture_arena);
+
+  MemArena hittable_ref_arena = {0};
+  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
+  HittableRefList bvh_include = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
+
+  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
+
+  HittableList hittables = {0};
+  hittables.objects = hittables_data;
+  hittables.size = WORLD_SIZE;
+
+  World world = { hittables, textures, bvh_include };
+  RenderSettings settings = {0};
 
   //bouncing_spheres_scene();
   //checkered_spheres_scene();
@@ -2412,5 +2410,7 @@ i32 main() {
   //perlin_spheres_scene();
   // quads_scene();
   // simple_light_scene();
-  cornell_box_scene();
+  //SCENE(cornell_box_scene);
+  SCENE(final_scene);
+  render(&world, &settings);
 }
