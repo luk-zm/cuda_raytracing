@@ -1,8 +1,8 @@
-rel: src/raytracing.cu | bin_folder
-	nvcc -arch native -lm raytracing.c -O3 -o bin/raytracing
+rel: src/main.cu | bin_folder
+	nvcc -arch native -lm src/main.cu -O3 -I include -o bin/raytracing
 
-debug: src/raytracing.cu | bin_folder
-	nvcc -arch native -g -lm raytracing.c -o bin/raytracing
+debug: src/main.cu | bin_folder
+	nvcc -arch native -g -lm src/main.cu -I include -o bin/raytracing
 
 run: rel
 	cd bin && ./raytracing
