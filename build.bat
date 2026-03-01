@@ -2,11 +2,13 @@
 setlocal enabledelayedexpansion
 cd /D "%~dp0"
 
-set flags=-arch sm_61
+set flags=-arch native
 
 for %%a in (%*) do set "%%~a=1"
 if "%debug%"=="1" set flags=%flags% -g -G
 
+if not exist bin mkdir bin
+
 pushd bin
-nvcc %flags% ..\raytracing.cu -DWINDOWS -I ..\include -o "raytracing.exe"
+nvcc %flags% ..\src\main.cu -I ..\include -o "raytracing.exe"
 popd

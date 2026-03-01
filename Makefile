@@ -1,8 +1,11 @@
-all: raytracing.c
-	gcc -DLINUX -g -lm raytracing.c -o bin/raytracer
+rel: src/raytracing.cu | bin_folder
+	nvcc -arch native -lm raytracing.c -O3 -o bin/raytracing
 
-rel: raytracing.c
-	gcc -DLINUX -lm raytracing.c -O3 -o bin/raytracer
+debug: src/raytracing.cu | bin_folder
+	nvcc -arch native -g -lm raytracing.c -o bin/raytracing
 
 run: rel
-	cd bin && ./raytracer
+	cd bin && ./raytracing
+
+bin_folder:
+	mkdir -p bin

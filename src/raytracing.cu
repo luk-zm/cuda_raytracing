@@ -1,83 +1,3 @@
-#include <math.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <time.h>
-#include <assert.h>
-#include <curand_kernel.h>
-#define STB_IMAGE_IMPLEMENTATION
-#include "include/stb_image.h"
-
-#include "utility.h"
-#include "vec3.h"
-#include "perlin_noise.h"
-
-// unity build
-#include "perlin_noise.c"
-
-#define WORLD_SIZE 8000
-
-#define PTR_TO_INT(p) (u64)((u8*)p - (u8*)0)
-#define INT_TO_PTR(n) (u8*)((u8*)0 + (n))
-
-//NOTE: alignment must be a power of 2
-__device__ __host__
-inline u64 align_up(u64 p, u64 alignment) {
-  return (p + alignment - 1) & ~(alignment - 1);
-}
-
-__device__ __host__
-inline u8 *align_ptr_up(u8 *p, u64 alignment) {
-  return INT_TO_PTR(align_up(PTR_TO_INT(p), alignment));
-}
-
-typedef struct {
-  u8 *data;
-  u64 current_pos;
-  u64 size;
-} MemArena;
-
-void mem_arena_alloc(MemArena *arena, u64 size) {
-  arena->size = size;
-  arena->data = (u8 *)malloc(size);
-  arena->current_pos = 0;
-}
-
-void *mem_arena_push(MemArena *arena, u64 size) {
-  u8 *result = NULL;
-  if (arena->current_pos + size <= arena->size) {
-    result = arena->data + arena->current_pos;
-    arena->current_pos += size;
-  }
-  //arena->current_pos = align_up(arena->current_pos, 256);
-  return (void *)result;
-}
-
-void mem_arena_free(MemArena *arena) {
-  free(arena->data);
-  arena->current_pos = 0;
-  arena->size = 0;
-}
-
-typedef MemArena GpuMemArena;
-
-void gpu_mem_arena_alloc(MemArena *arena, u64 size) {
-  arena->size = size;
-  (u8 *)cudaMalloc(&arena->data, size);
-  arena->current_pos = 0;
-}
-
-void *gpu_mem_arena_push(MemArena *arena, u64 size) {
-  return mem_arena_push(arena, size);
-}
-
-void gpu_mem_arena_free(MemArena *arena) {
-  cudaFree(arena->data);
-  arena->current_pos = 0;
-  arena->size = 0;
-}
-
 typedef u16 HittableRef;
 
 typedef struct {
@@ -927,7 +847,7 @@ void hittable_list_set(HittableList *list, u64 idx, Hittable hittable) {
   }
 }
 
-WorldRef make_bvh_node_from_hittable_list_bound(HittableList *hittables, HittableRefList *world,
+WorldRef make_bvh_bound(HittableList *hittables, HittableRefList *world,
     u64 world_start, u64 world_end) {
   Hittable curr_node = {0};
   curr_node.type = VIS_OBJECT_BVH_NODE;
@@ -966,8 +886,8 @@ WorldRef make_bvh_node_from_hittable_list_bound(HittableList *hittables, Hittabl
     }
 #endif
     u64 mid = world_start + span / 2;
-    node->left = make_bvh_node_from_hittable_list_bound(hittables, world, world_start, mid);
-    node->right = make_bvh_node_from_hittable_list_bound(hittables, world, mid, world_end);
+    node->left = make_bvh_bound(hittables, world, world_start, mid);
+    node->right = make_bvh_bound(hittables, world, mid, world_end);
   }
 
   Aabb *left_bbox =
@@ -979,9 +899,9 @@ WorldRef make_bvh_node_from_hittable_list_bound(HittableList *hittables, Hittabl
   return result;
 }
 
-WorldRef make_bvh_node_from_hittable_list(HittableList *hittables, HittableRefList *world) {
+WorldRef make_bvh(HittableList *hittables, HittableRefList *world) {
   WorldRef result =
-    make_bvh_node_from_hittable_list_bound(hittables, world, 0, world->count);
+    make_bvh_bound(hittables, world, 0, world->count);
   return result;
 }
 
@@ -1409,6 +1329,7 @@ vec3 ray_color_no_bvh(SceneData *sd, PerPixelGpuData *gd, Ray *ray, vec3 backgro
 
   return result;
 }
+
 __device__
 vec3 ray_color(SceneData *sd, PerPixelGpuData *gd, Ray *ray, vec3 background_color) {
   i32 max_bounces = gd->rc_stack.max_count;
@@ -1520,102 +1441,6 @@ vec3 zero_vec() {
   return Vec3(0.0f, 0.0f, 0.0f);
 }
 
-b32 vec3_to_unit_vec_test() {
-  fprintf(stderr, "vec3_to_unit test start\n");
-  vec3 inputs[] = { Vec3(1.0f, 1.0f, 1.0f), Vec3(0.5f, 0.5f, 0.5f),
-    Vec3(10.0f, 0.5f, 12.7f) };
-  vec3 expected[] = { Vec3(0.57735f, 0.57735f, 0.57735f),
-    Vec3(0.57735f, 0.57735f, 0.57735f), Vec3(0.61835f, 0.030917f, 0.7853f) };
-  i32 vec_count = sizeof(inputs) / sizeof(inputs[0]);
-  for (i32 i = 0; i < vec_count; ++i) {
-    inputs[i] = vec3_to_unit_vec(inputs[i]);
-    if (!vec3_is_same_approx(inputs[i], expected[i])) {
-      fprintf(stderr, "vec3_to_unit test failure\n");
-      fprintf(stderr, "Failed at input vector #%d\n", i);
-      fprintf(stderr, "Expected (%f, %f, %f), got (%f, %f, %f)", 
-          expected[i].x, expected[i].y, expected[i].z,
-          inputs[i].x, inputs[i].y, inputs[i].z);
-      return 0;
-    }
-  }
-  fprintf(stderr, "vec3_to_unit test success\n");
-  return 1;
-}
-
-#if LINUX
-i64 timer_start_ns() {
-  struct timespec time;
-  clock_gettime(CLOCK_MONOTONIC, &time);
-  return time.tv_sec * 1000000 + time.tv_nsec;
-}
-
-i64 timer_stop_ns(i64 start_time) {
-  struct timespec time;
-  clock_gettime(CLOCK_MONOTONIC, &time);
-  return time.tv_sec * 1000000 + time.tv_nsec - start_time;
-}
-
-f64 timer_start_ms() {
-  struct timespec time;
-  clock_gettime(CLOCK_MONOTONIC, &time);
-  return (f64)time.tv_sec * 1e3 + (f64)time.tv_nsec / 1e6;
-}
-
-f64 timer_stop_ms(f64 start_time) {
-  struct timespec time;
-  clock_gettime(CLOCK_MONOTONIC, &time);
-  return (f64)time.tv_sec * 1e3 + (f64)time.tv_nsec / 1e6 - start_time;
-}
-
-f64 timer_start() {
-  struct timespec time;
-  clock_gettime(CLOCK_MONOTONIC, &time);
-  return (f64)time.tv_sec + (f64)time.tv_nsec / 1000000000.0;
-}
-
-f64 timer_stop(f64 start_time) {
-  struct timespec time;
-  clock_gettime(CLOCK_MONOTONIC, &time);
-  return ((f64)time.tv_sec + (f64)time.tv_nsec / 1000000000.0) - start_time;
-}
-
-#elif WINDOWS
-#include <intrin.h>
-#include <windows.h>
-
-LARGE_INTEGER freq;
-
-f64 timer_start_ns() {
-  return (f64)__rdtsc();
-}
-
-f64 timer_stop_ns(f64 start_time) {
-  return (__rdtsc() - start_time) / 3.7;
-}
-
-f64 timer_start_ms() {
-  return (f64)__rdtsc();
-}
-
-f64 timer_stop_ms(f64 start_time) {
-  return ((f64)__rdtsc() - start_time) / 3700000.0;
-}
-
-u64 timer_start() {
-  QueryPerformanceFrequency(&freq);
-  LARGE_INTEGER ticks;
-  QueryPerformanceCounter(&ticks);
-  return ticks.QuadPart;
-}
-
-f64 timer_stop(u64 start_time) {
-  LARGE_INTEGER ticks;
-  QueryPerformanceCounter(&ticks);
-  return (f64)(ticks.QuadPart - start_time) / (f64)freq.QuadPart;
-}
-
-#endif
-
 inline vec3 random_in_unit_disk() {
   while (1) {
     vec3 rand = Vec3(random_f32_bound(-1.0f, 1.0f), random_f32_bound(-1.0f, 1.0f), 0.0f);
@@ -1695,9 +1520,13 @@ typedef struct {
   const char *img_name;
 } RenderSettings;
 
-static RenderSettings g_default_render_settings = 
+static RenderSettings g_bouncing_spheres_settings = 
   { 16.0f/9.0f, 1200, 100, 50, 20.0f, { 13.0f, 2.0f, 3.0f },
     { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 0.6f, {0.7f, 0.8f, 1.0f}, "image.ppm" };
+
+static RenderSettings g_default_render_settings = 
+  { 1, 800, 100, 50, 90, {0,0,0},
+    {0,0,-1}, {0,1,0}, 0.0f, {0.7f, 0.8f, 1.0f}, "image.ppm" };
 
 #define CUDA_CHECK(x) do {                         \
     cudaError_t err = x;                           \
@@ -1821,9 +1650,9 @@ void render(World *world, RenderSettings *settings) {
   HittableList *hittables = &world->all_hittables;
   HittableRefList *bvh_include = &world->bvh_include;
   TextureList *textures = &world->textures;
-  WorldRef root_bvh_node = make_bvh_node_from_hittable_list(hittables, bvh_include);
+  WorldRef root_bvh_node = make_bvh(hittables, bvh_include);
 
-  print_bvh_info(hittables->objects, bvh_include->data, root_bvh_node);
+  // print_bvh_info(hittables->objects, bvh_include->data, root_bvh_node);
 
   f32 pixel_samples_scale = 1.0f / (f32)settings->samples_per_pixel;
 
@@ -1925,8 +1754,6 @@ void render(World *world, RenderSettings *settings) {
   cuda_calc<<<num_blocks, block_size>>>(gpu_sd, gd, pixels_colors, img_width, n, *settings,
       pixel_delta_v, pixel_delta_u, camera_pos, defocus_disk_u, defocus_disk_v,
       pixel_samples_scale, current_pixel_center);
-  //CUDA_CHECK(cudaDeviceSynchronize());
-  //CUDA_CHECK(cudaGetLastError());
 
   err = cudaGetLastError();
   printf("cuda_calc launch error: %s\n", cudaGetErrorString(err));
@@ -2189,7 +2016,7 @@ void bouncing_spheres_scene(World *world, RenderSettings *settings) {
   Material mat3 = add_mat_metal(world, Vec3(0.7f, 0.6f, 0.5f), 0.0f);
   add_sphere(world, Vec3(4, 1, 0), 1, mat3);
 
-  *settings = g_default_render_settings;
+  *settings = g_bouncing_spheres_settings;
 }
 
 void checkered_spheres_scene(World *world, RenderSettings *settings) {
@@ -2296,16 +2123,6 @@ void cornell_box_scene(World *world, RenderSettings *settings) {
   add_quad(world, Vec3(555,555,555),   Vec3(-555,0,0), Vec3(0,0,-555), white);
   add_quad(world, Vec3(0,0,555),       Vec3(555,0,0),  Vec3(0,555,0),  white);
 
-#if 1
-  Material metal = add_mat_metal(world, Vec3(0.7f, 0.6f, 0.5f), 0.6f);
-  add_yrot_trans_pyramid(world, 60, Vec3(200, 0, 150),
-      Vec3(0, 0, 0), Vec3(160, 0, 160), Vec3(100,400,100), metal);
-#else
-  add_trans_quad(world, Vec3(500, 200, 100), Vec3(0,0,0), Vec3(100,0,0), Vec3(50,50,50), green);
-  add_trans_quad(world, Vec3(100,200,100), Vec3(0,0,0), Vec3(100,0,0), Vec3(50,50,50), green);
-  add_trans_quad(world, Vec3(0,200,100), Vec3(0,0,0), Vec3(100,0,0), Vec3(50,50,50), green);
-#endif
-
 #if 0
   add_box(world, Vec3(130,0,65), Vec3(295,165,230), white);
 #else
@@ -2321,12 +2138,13 @@ void cornell_box_scene(World *world, RenderSettings *settings) {
   settings->img_ratio = 1.0f;
   settings->img_width = 600;
   settings->samples_per_pixel = 200;
-  settings->max_bounces = 50;
+  settings->max_bounces = 40;
   settings->vfov = 40;
   settings->lookfrom = Vec3(278, 278, -800);
   settings->lookat = Vec3(278, 278, 0);
   settings->view_up = Vec3(0, 1, 0);
   settings->defocus_angle = 0;
+  settings->background_color = Vec3(0,0,0);
   settings->img_name = "cornell_box.ppm";
 }
 
@@ -2379,38 +2197,125 @@ void final_scene(World *world, RenderSettings *settings) {
   settings->lookat = Vec3(278, 278, 0);
   settings->view_up = Vec3(0.0f, 0.1f, 0.0f);
   settings->defocus_angle = 0.0f;
+  settings->background_color = ZERO_VEC;
   settings->img_name = "feature_test.ppm";
 }
 
-#define SCENE(x) x(&world, &settings)
+#define DEFSC(name) void name(World *world, RenderSettings *settings)
 
-i32 main() {
-  // vec3_to_unit_vec_test();
+DEFSC(fv1) {
+  add_sphere(world, Vec3(0,0.5,-1), 0.5, add_mat_lamb_sc(world, Vec3(0,0.5,0)));
+  add_quad(world, Vec3(-5,0,1), Vec3(10,0,0), Vec3(0,0,-5), add_mat_lamb_sc(world, Vec3(0.73,0.73,0.73)));
+  add_trans_box(world,Vec3(-1.5,0,-1), ZERO_VEC, Vec3(0.7,0.7,0.7), add_mat_lamb_sc(world, Vec3(0.5,0,0)));
+  add_yrot_trans_pyramid(world, 30, Vec3(1,0,-1), 
+      ZERO_VEC, Vec3(0.7,0,0.7), Vec3(0.35,1.5,0.35), add_mat_lamb_sc(world, Vec3(0,0,0.5)));
 
-  MemArena texture_arena = {0};
-  mem_arena_alloc(&texture_arena, MB(10));
-  TextureList textures = make_texture_list(&texture_arena);
-
-  MemArena hittable_ref_arena = {0};
-  mem_arena_alloc(&hittable_ref_arena, sizeof(HittableRef) * WORLD_SIZE);
-  HittableRefList bvh_include = make_hittable_ref_list(&hittable_ref_arena, WORLD_SIZE);
-
-  Hittable hittables_data[WORLD_SIZE]; // remember about the merge sort copy
-
-  HittableList hittables = {0};
-  hittables.objects = hittables_data;
-  hittables.size = WORLD_SIZE;
-
-  World world = { hittables, textures, bvh_include };
-  RenderSettings settings = {0};
-
-  //bouncing_spheres_scene();
-  //checkered_spheres_scene();
-  //earth_scene();
-  //perlin_spheres_scene();
-  // quads_scene();
-  // simple_light_scene();
-  //SCENE(cornell_box_scene);
-  SCENE(final_scene);
-  render(&world, &settings);
+  settings->img_width = 800;
+  settings->img_ratio = 16.0/9.0;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 40;
+  settings->lookfrom = Vec3(0,0.9,0.75);
+  settings->lookat = Vec3(0,0.5,-1);
+  settings->img_name = "fv1.ppm";
 }
+
+void metal_test_scene(World *world, RenderSettings *settings, f32 fuzziness, const char *name) {
+  add_sphere(world, Vec3(0,0.5,-1), 0.5, add_mat_metal(world, Vec3(0.8,0.8,0.8), fuzziness));
+  add_quad(world, Vec3(-5,0,1), Vec3(10,0,0), Vec3(0,0,-5), add_mat_lamb_sc(world, Vec3(0.73,0.73,0.73)));
+  add_trans_box(world,Vec3(-1.5,0,-1), ZERO_VEC, Vec3(0.7,0.7,0.7), add_mat_lamb_sc(world, Vec3(0.5,0,0)));
+  add_yrot_trans_pyramid(world, 30, Vec3(1,0,-1), 
+      ZERO_VEC, Vec3(0.7,0,0.7), Vec3(0.35,1.5,0.35), add_mat_lamb_sc(world, Vec3(0,0,0.5)));
+
+  settings->img_width = 800;
+  settings->img_ratio = 16.0/9.0;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 40;
+  settings->lookfrom = Vec3(0,0.9,0);
+  settings->lookat = Vec3(0,0.5,-1);
+  settings->img_name = name;
+}
+
+DEFSC(fv2) {
+  metal_test_scene(world, settings, 0, "fv2.ppm");
+}
+
+DEFSC(fv3) {
+  metal_test_scene(world, settings, 0.2, "fv3.ppm");
+}
+
+DEFSC(fv4) {
+  metal_test_scene(world, settings, 0.5, "fv4.ppm");
+}
+
+DEFSC(fv5) {
+  metal_test_scene(world, settings, 1, "fv5.ppm");
+}
+
+void refract_test_scene(World *world, RenderSettings *settings, f32 refract, const char *name) {
+  add_sphere(world, Vec3(-0.4,0.5,-2), 0.5, add_mat_lamb_sc(world, Vec3(0.5, 0.5, 0)));
+  add_sphere(world, Vec3(0,0.5,-1), 0.5, add_mat_dielectric(world, refract));
+  add_quad(world, Vec3(-5,0,1), Vec3(10,0,0), Vec3(0,0,-5), add_mat_lamb_sc(world, Vec3(0.73,0.73,0.73)));
+  add_trans_box(world,Vec3(-1.5,0,-1), ZERO_VEC, Vec3(0.7,0.7,0.7), add_mat_lamb_sc(world, Vec3(0.5,0,0)));
+  add_yrot_trans_pyramid(world, 30, Vec3(1,0,-1), 
+      ZERO_VEC, Vec3(0.7,0,0.7), Vec3(0.35,1.5,0.35), add_mat_lamb_sc(world, Vec3(0,0,0.5)));
+
+  settings->img_width = 800;
+  settings->img_ratio = 16.0/9.0;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 40;
+  settings->lookfrom = Vec3(0,0.9,0);
+  settings->lookat = Vec3(0,0.5,-1);
+  settings->img_name = name;
+}
+
+DEFSC(refract1) {
+  refract_test_scene(world, settings, 1, "refract1.ppm");
+}
+
+DEFSC(refract2) {
+  refract_test_scene(world, settings, 1.05, "refract2.ppm");
+}
+
+DEFSC(refract3) {
+  refract_test_scene(world, settings, 1.333, "refract3.ppm");
+}
+
+DEFSC(refract4) {
+  refract_test_scene(world, settings, 1.5, "refract4.ppm");
+}
+
+DEFSC(refract5) {
+  refract_test_scene(world, settings, 2.417, "refract5.ppm");
+}
+
+DEFSC(motion_blur_scene) {
+  add_mov_sphere(world, Vec3(-1,0.5,-1), Vec3(0,1,0), 0.5, add_mat_lamb_sc(world, Vec3(0.5, 0.5, 0)));
+  add_mov_sphere(world, Vec3(1,0.5,-1), Vec3(0,0.5,0), 0.5, add_mat_lamb_sc(world, Vec3(0.5, 0.5, 0.5)));
+  add_quad(world, Vec3(-5,0,1), Vec3(10,0,0), Vec3(0,0,-5), add_mat_lamb_sc(world, Vec3(0.73,0.73,0.73)));
+
+  settings->img_width = 800;
+  settings->img_ratio = 16.0/9.0;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 40;
+  settings->lookfrom = Vec3(0,0.9,0.5);
+  settings->lookat = Vec3(0,0.5,-1);
+  settings->img_name = "mblur.ppm";
+}
+
+DEFSC(light_test_scene) {
+  add_sphere(world, Vec3(0,0.5,-1), 0.5, add_mat_light_sc(world, Vec3(15,15,15)));
+  add_quad(world, Vec3(-5,0,1), Vec3(10,0,0), Vec3(0,0,-5), add_mat_lamb_sc(world, Vec3(0.73,0.73,0.73)));
+  add_trans_box(world,Vec3(-1.5,0,-1), ZERO_VEC, Vec3(0.7,0.7,0.7), add_mat_lamb_sc(world, Vec3(0.5,0,0)));
+  add_yrot_trans_pyramid(world, 30, Vec3(1,0,-1), 
+      ZERO_VEC, Vec3(0.7,0,0.7), Vec3(0.35,1.5,0.35), add_mat_lamb_sc(world, Vec3(0,0,0.5)));
+
+  settings->img_width = 800;
+  settings->img_ratio = 16.0/9.0;
+  settings->samples_per_pixel = 100;
+  settings->max_bounces = 40;
+  settings->lookfrom = Vec3(0,0.9,0.75);
+  settings->lookat = Vec3(0,0.5,-1);
+  settings->background_color = Vec3(0,0,0);
+  settings->img_name = "lighttest.ppm";
+}
+
